@@ -1,5 +1,6 @@
 #!/bin/sh
-# Open-Box 一键安装脚本(POSIX sh,兼容 OpenWrt ash;不使用 bash 专有语法)。
+# Open-Box 一键安装脚本(POSIX sh,兼容 OpenWrt ash 与 Debian dash;不使用 bash 专有语法)。
+# 支持 OpenWrt 路由器,以及 Debian / Ubuntu(systemd;见下方 detect_platform 的说明)。
 #
 # 用法:
 #   sh install.sh                  # 直连 GitHub 下载
@@ -65,6 +66,7 @@ openbox_env_report() {
     echo ""
     echo "---- 环境信息(反馈问题时请连同上面的错误一起贴出来)----"
     echo "固件: $(sed -n 's/^DISTRIB_DESCRIPTION=//p' /etc/openwrt_release 2>/dev/null | tr -d "\"'" | head -n 1)"
+    echo "系统: $(sed -n 's/^PRETTY_NAME=//p' /etc/os-release 2>/dev/null | tr -d "\"'" | head -n 1)  服务管理: $([ -d /run/systemd/system ] && echo systemd || echo procd)"
     echo "内核: $(uname -r 2>/dev/null)  架构: $(uname -m 2>/dev/null)"
     echo "安装目录: $INSTALL_ROOT"
     echo "$_er_root_parent 所在文件系统: $(awk -v d="$_er_root_parent" '{ mp=$2; if (mp=="/" || index(d"/", mp"/")==1) { if (length(mp) > bl) { bl=length(mp); best=$1" 挂在 "mp" ("$3", "$4")" } } } END { print best }' /proc/mounts 2>/dev/null)"
@@ -289,8 +291,24 @@ check_root() {
   [ "$(id -u)" = "0" ] || die "请以 root 身份运行本脚本(OpenWrt 默认通过 SSH 以 root 登录)。"
 }
 
-check_openwrt() {
-  [ -r /etc/openwrt_release ] || die "未检测到 OpenWrt 系统(缺少 /etc/openwrt_release)。Open-Box 只支持安装在 OpenWrt 路由器上。"
+# 跑在哪种系统上。OpenWrt(procd / uci / LuCI)是原生形态;Debian / Ubuntu(systemd)2026-09 起也能装:
+# 服务由 systemd 管(debian/systemd/*.service),面板用 debian/bin/ 下的 systemctl 包装脚本代替 /etc/init.d,
+# 没有 LuCI、没有 dnsmasq 分流、防火墙自理(README 有说明)。两种都不是就拒绝。
+PLATFORM=""
+detect_platform() {
+  if [ -r /etc/openwrt_release ]; then
+    PLATFORM="openwrt"
+    CORE_SVC=/etc/init.d/openbox
+    PANEL_SVC=/etc/init.d/openbox-panel
+    CLI_LINK=/usr/bin/open-box
+  elif [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    PLATFORM="systemd"
+    CORE_SVC="$INSTALL_ROOT/debian/bin/openbox-ctl"
+    PANEL_SVC="$INSTALL_ROOT/debian/bin/openbox-panel-ctl"
+    CLI_LINK=/usr/local/bin/open-box
+  else
+    die "未检测到 OpenWrt(缺少 /etc/openwrt_release),也不是 systemd 系统。Open-Box 支持 OpenWrt 路由器和 Debian / Ubuntu(systemd)。"
+  fi
 }
 
 map_arch() {
@@ -368,7 +386,7 @@ check_conflicts() {
 ENV_REPORT_ON=1
 info "开始预检..."
 check_root
-check_openwrt
+detect_platform
 map_arch
 check_storage
 check_memory
@@ -435,7 +453,20 @@ dep_ok() {
     kmod-veth) [ -d "$DEP_SYS_MODULE/veth" ] || modprobe veth >/dev/null 2>&1 ;;
     ip-full) ip netns list >/dev/null 2>&1 ;;
     ca-bundle) [ -s "$DEP_CA_BUNDLE" ] ;;
+    # 下面两个只在 Debian / Ubuntu 上检查:nft 命令装 Open-Box 自己的表,xz 解 nodejs.org 的 Node 包
+    nftables) command -v nft >/dev/null 2>&1 ;;
+    xz-utils) command -v xz >/dev/null 2>&1 ;;
     *) return 0 ;;
+  esac
+}
+# 依赖名按 OpenWrt 的包名写;Debian / Ubuntu 换成 apt 的包名,内核模块随发行版内核自带(没有单独的包,装不上只能提示)
+dep_pkg() {
+  [ "${_dep_pm:-}" = "apt-get" ] || { echo "$1"; return 0; }
+  case "$1" in
+    kmod-*) echo "" ;;
+    ip-full) echo "iproute2" ;;
+    ca-bundle) echo "ca-certificates" ;;
+    *) echo "$1" ;;
   esac
 }
 dep_effect() {
@@ -445,6 +476,8 @@ dep_effect() {
     kmod-nft-nat) echo "auto_redirect 转发规则加不上,退到兼容模式" ;;
     kmod-veth|ip-full) echo "规则页不能模拟 LAN 终端(可改用内核诊断)" ;;
     ca-bundle) echo "HTTPS 订阅和更新下载会因证书校验失败" ;;
+    nftables) echo "起内核前装不上 Open-Box 自己的 nft 表(进内核前放行 / 直连应答放行不生效)" ;;
+    xz-utils) echo "解不开 nodejs.org 的 Node 压缩包,面板跑不起来" ;;
   esac
 }
 ensure_dependencies() {
@@ -453,6 +486,7 @@ ensure_dependencies() {
     return 0
   fi
   _dep_all="kmod-tun kmod-nft-queue kmod-nft-nat kmod-veth ip-full ca-bundle"
+  [ "${PLATFORM:-openwrt}" = "systemd" ] && _dep_all="$_dep_all nftables xz-utils"
   _dep_missing=""
   for _d in $_dep_all; do dep_ok "$_d" || _dep_missing="$_dep_missing $_d"; done
   if [ -z "$_dep_missing" ]; then
@@ -463,9 +497,10 @@ ensure_dependencies() {
   _dep_verb=""
   if command -v opkg >/dev/null 2>&1; then _dep_pm=opkg; _dep_verb="opkg install"
   elif command -v apk >/dev/null 2>&1; then _dep_pm=apk; _dep_verb="apk add"
+  elif command -v apt-get >/dev/null 2>&1; then _dep_pm=apt-get; _dep_verb="apt-get install -y --no-install-recommends"; export DEBIAN_FRONTEND=noninteractive
   fi
   if [ -z "$_dep_pm" ]; then
-    warn "缺少系统依赖:${_dep_missing# };没找到 opkg / apk,请自行安装。"
+    warn "缺少系统依赖:${_dep_missing# };没找到 opkg / apk / apt-get,请自行安装。"
   else
     info "缺少系统依赖:${_dep_missing# },尝试用 $_dep_pm 安装(软件源不通时只提示,不中断)..."
     _dep_to=""
@@ -473,7 +508,9 @@ ensure_dependencies() {
     $_dep_to $_dep_pm update >/dev/null 2>&1 || warn "$_dep_pm update 失败(软件源不通?),仍尝试安装。"
     # 逐个装:一个装不上不连累其它(内核模块包要和当前内核版本一致,厂商固件常对不上)
     for _d in $_dep_missing; do
-      $_dep_to $_dep_verb "$_d" >/dev/null 2>&1 || true
+      _dep_pkg=$(dep_pkg "$_d")
+      [ -n "$_dep_pkg" ] || continue
+      $_dep_to $_dep_verb "$_dep_pkg" >/dev/null 2>&1 || true
     done
   fi
   _dep_still=""
@@ -483,7 +520,12 @@ ensure_dependencies() {
     return 0
   fi
   for _d in $_dep_still; do
-    warn "仍缺 $_d:$(dep_effect "$_d")。可稍后手动执行:${_dep_verb:-opkg install} $_d"
+    _dep_pkg=$(dep_pkg "$_d")
+    if [ -n "$_dep_pkg" ]; then
+      warn "仍缺 $_d:$(dep_effect "$_d")。可稍后手动执行:${_dep_verb:-opkg install} $_dep_pkg"
+    else
+      warn "仍缺 $_d:$(dep_effect "$_d")。这个内核模块应随系统内核自带,请检查内核配置(modprobe ${_d#kmod-} 的报错)。"
+    fi
   done
   return 0
 }
@@ -497,6 +539,9 @@ detect_downloader() {
   elif command -v wget >/dev/null 2>&1; then
     DOWNLOADER="wget"
   else
+    if [ "$PLATFORM" = "systemd" ]; then
+      die "系统缺少 curl 与 wget,无法下载安装包。请先执行: apt-get install -y curl"
+    fi
     die "系统缺少 curl 与 wget,无法下载安装包。请先执行: opkg update && opkg install curl"
   fi
 }
@@ -707,6 +752,52 @@ fi
 # root(0);统一改回 0:0,避免残留一个陌生 uid(P6 终审 Minor)。
 chown -R 0:0 "$INSTALL_ROOT" || warn "重置 $INSTALL_ROOT 属主为 root 失败,可能不影响使用。"
 
+# ---- openbox-glibc-node:start ----
+# 这一段在 install.sh / update.sh 两份里**一模一样**,由 panel/server/system/script-parity.test.mjs 守着逐字相同。
+#
+# Debian / Ubuntu:发布包里的 Node 是 OpenWrt 用的 musl 版,glibc 系统上根本起不来(没有 musl 的加载器)。
+# 按 meta.json 里的 nodeVersion 从 nodejs.org(不通就换 npmmirror)取同一版本的官方 glibc 二进制,对着
+# SHASUMS256.txt 校验后只换 node/bin/node,再删掉 node/lib/(musl 版 libstdc++,glibc 的 Node 装上它会崩)。
+# 换过的目录留一个 node/.flavor 标记(glibc <版本>):已经是这个版本的 glibc Node 就什么都不做——升级时
+# 运行时组件没变,组件更新会把原来的 node/ 原样带过来。
+openbox_glibc_node() {
+  _gn_root="$1"
+  _gn_ver=$(sed -n 's/.*"nodeVersion" *: *"\([^"]*\)".*/\1/p' "$_gn_root/meta.json" 2>/dev/null | head -n 1)
+  _gn_arch=$(sed -n 's/.*"arch" *: *"\([^"]*\)".*/\1/p' "$_gn_root/meta.json" 2>/dev/null | head -n 1)
+  [ -n "$_gn_ver" ] && [ -n "$_gn_arch" ] || { echo "meta.json 里没有 nodeVersion / arch"; return 1; }
+  if [ -x "$_gn_root/node/bin/node" ] && [ "$(cat "$_gn_root/node/.flavor" 2>/dev/null)" = "glibc $_gn_ver" ]; then
+    return 0
+  fi
+  _gn_name="node-v$_gn_ver-linux-$_gn_arch"
+  _gn_tmp="$_gn_root/.node-glibc.$$"
+  rm -rf "$_gn_tmp"
+  mkdir -p "$_gn_tmp" || { echo "无法创建 $_gn_tmp"; return 1; }
+  _gn_ok=""
+  for _gn_base in "https://nodejs.org/dist/v$_gn_ver" "https://npmmirror.com/mirrors/node/v$_gn_ver"; do
+    echo "  从 $_gn_base 下载 $_gn_name.tar.xz ..." >&2
+    rm -f "$_gn_tmp/SHASUMS256.txt" "$_gn_tmp/$_gn_name.tar.xz"
+    fetch_to_file "$_gn_base/SHASUMS256.txt" "$_gn_tmp/SHASUMS256.txt" 2>/dev/null || continue
+    fetch_to_file "$_gn_base/$_gn_name.tar.xz" "$_gn_tmp/$_gn_name.tar.xz" 2>/dev/null || continue
+    _gn_want=$(grep " $_gn_name\.tar\.xz\$" "$_gn_tmp/SHASUMS256.txt" 2>/dev/null | awk '{print $1}' | head -n 1)
+    _gn_have=$(sha256sum "$_gn_tmp/$_gn_name.tar.xz" 2>/dev/null | awk '{print $1}')
+    if [ -n "$_gn_want" ] && [ "$_gn_want" = "$_gn_have" ]; then _gn_ok=1; break; fi
+    echo "  校验不符,换一个源" >&2
+  done
+  [ -n "$_gn_ok" ] || { rm -rf "$_gn_tmp"; echo "下载 glibc 版 Node $_gn_ver 失败(nodejs.org 与 npmmirror 都没拿到)"; return 1; }
+  if ! tar -xJf "$_gn_tmp/$_gn_name.tar.xz" -C "$_gn_tmp" "$_gn_name/bin/node"; then
+    rm -rf "$_gn_tmp"
+    echo "解包 $_gn_name.tar.xz 失败(缺 xz?)"
+    return 1
+  fi
+  mkdir -p "$_gn_root/node/bin"
+  mv -f "$_gn_tmp/$_gn_name/bin/node" "$_gn_root/node/bin/node" || { rm -rf "$_gn_tmp"; echo "替换 node/bin/node 失败"; return 1; }
+  chmod +x "$_gn_root/node/bin/node"
+  rm -rf "$_gn_root/node/lib" "$_gn_tmp"
+  printf 'glibc %s\n' "$_gn_ver" > "$_gn_root/node/.flavor"
+  return 0
+}
+# ---- openbox-glibc-node:end ----
+
 # ---- openbox-node-smoke:start ----
 # 随包的 Node 真的能在这台机器上跑起来吗?(GitHub #145)
 # `node -v` 不算数 —— 打版本号在解析参数阶段就返回了,V8 还没初始化;真正跑一句脚本才会暴露
@@ -728,6 +819,14 @@ openbox_node_smoke() {
 VERSION=$(sed -n 's/.*"version" *: *"\([^"]*\)".*/\1/p' "$INSTALL_ROOT/meta.json" 2>/dev/null | head -n 1)
 [ -n "$VERSION" ] || VERSION="未知版本"
 
+if [ "$PLATFORM" = "systemd" ]; then
+  info "Debian / Ubuntu:下载 glibc 版 Node 运行时(发布包里的是 OpenWrt 用的 musl 版)..."
+  if ! _gn_err=$(openbox_glibc_node "$INSTALL_ROOT"); then
+    [ -n "$_gn_err" ] && printf '%s\n' "$_gn_err" >&2
+    die "glibc 版 Node 没装上,面板跑不起来,安装中止。请检查能否访问 nodejs.org 或 npmmirror.com 后重新运行安装脚本。"
+  fi
+fi
+
 info "检查随包 Node 能否运行..."
 if ! _ob_node_err=$(openbox_node_smoke); then
   warn "随包的 Node 在这台设备上起不来:"
@@ -746,19 +845,30 @@ fi
 mkdir -p "$INSTALL_ROOT/data" || die "无法创建 $INSTALL_ROOT/data。"
 printf '%s\n' "$PANEL_PORT" > "$INSTALL_ROOT/data/panel-port" || die "无法写入面板端口文件。"
 
-# ---------- init 脚本 ----------
-cp "$INSTALL_ROOT/openwrt/initd/openbox" /etc/init.d/openbox || die "无法安装 /etc/init.d/openbox。"
-cp "$INSTALL_ROOT/openwrt/initd/openbox-panel" /etc/init.d/openbox-panel || die "无法安装 /etc/init.d/openbox-panel。"
-chmod +x /etc/init.d/openbox /etc/init.d/openbox-panel
-
-# 命令行 open-box:SSH 登上路由器后敲 open-box,看面板密码 / 检查升级(忘了密码的人靠它找回)。
-# 不覆盖别人放在 /usr/bin/open-box 的真文件;建不了只警告,不影响安装
-if [ -f "$INSTALL_ROOT/openwrt/bin/open-box" ] && { [ ! -e /usr/bin/open-box ] || [ -L /usr/bin/open-box ]; }; then
-  chmod +x "$INSTALL_ROOT/openwrt/bin/open-box" 2>/dev/null || true
-  ln -sf "$INSTALL_ROOT/openwrt/bin/open-box" /usr/bin/open-box || warn "无法创建 /usr/bin/open-box(不影响面板;需要时可直接运行 $INSTALL_ROOT/openwrt/bin/open-box)。"
+# ---------- init 脚本 / systemd 单元 ----------
+if [ "$PLATFORM" = "systemd" ]; then
+  # Debian / Ubuntu:两个 systemd 单元铺到 /etc/systemd/system,面板 / 命令行 open-box 通过 debian/bin/ 下的
+  # 包装脚本(和 init 脚本同一套动作)调 systemctl;logread 替身在 debian/shim/,由面板单元的 PATH 带上
+  chmod +x "$INSTALL_ROOT/debian/bin/"* "$INSTALL_ROOT/debian/shim/"* 2>/dev/null || true
+  cp "$INSTALL_ROOT/debian/systemd/openbox.service" /etc/systemd/system/openbox.service || die "无法安装 /etc/systemd/system/openbox.service。"
+  cp "$INSTALL_ROOT/debian/systemd/openbox-panel.service" /etc/systemd/system/openbox-panel.service || die "无法安装 /etc/systemd/system/openbox-panel.service。"
+  chmod 644 /etc/systemd/system/openbox.service /etc/systemd/system/openbox-panel.service 2>/dev/null || true
+  systemctl daemon-reload || warn "systemctl daemon-reload 失败,单元文件可能要等重启后才生效。"
+else
+  cp "$INSTALL_ROOT/openwrt/initd/openbox" /etc/init.d/openbox || die "无法安装 /etc/init.d/openbox。"
+  cp "$INSTALL_ROOT/openwrt/initd/openbox-panel" /etc/init.d/openbox-panel || die "无法安装 /etc/init.d/openbox-panel。"
+  chmod +x /etc/init.d/openbox /etc/init.d/openbox-panel
 fi
 
-# ---------- LuCI 三文件 ----------
+# 命令行 open-box:SSH 登上路由器后敲 open-box,看面板密码 / 检查升级(忘了密码的人靠它找回)。
+# OpenWrt 放 /usr/bin,Debian 放 /usr/local/bin(CLI_LINK)。不覆盖别人放在那里的真文件;建不了只警告,不影响安装
+if [ -f "$INSTALL_ROOT/openwrt/bin/open-box" ] && { [ ! -e "$CLI_LINK" ] || [ -L "$CLI_LINK" ]; }; then
+  chmod +x "$INSTALL_ROOT/openwrt/bin/open-box" 2>/dev/null || true
+  ln -sf "$INSTALL_ROOT/openwrt/bin/open-box" "$CLI_LINK" || warn "无法创建 $CLI_LINK(不影响面板;需要时可直接运行 $INSTALL_ROOT/openwrt/bin/open-box)。"
+fi
+
+# ---------- LuCI 三文件(只有 OpenWrt 有 LuCI) ----------
+if [ "$PLATFORM" = "openwrt" ]; then
 mkdir -p /www/luci-static/resources/view/openbox || die "无法创建 LuCI 视图目录。"
 # 按目录拷,不写死文件名:视图文件改过一次名(status.js → main.js,为的是绕开浏览器对
 # luci-static 的缓存),以后还可能再改;写死名字的话,新包配上一份旧脚本就会在这里硬失败
@@ -795,19 +905,30 @@ rm -rf /tmp/luci-*cache* 2>/dev/null || true
 if [ "$_acl_changed" = "1" ] && [ -x /etc/init.d/rpcd ]; then
   /etc/init.d/rpcd restart >/dev/null 2>&1 || warn "重启 rpcd 失败,LuCI 页面权限可能要等下次重启路由器后才生效。"
 fi
+fi
 
 # ---------- 启动面板(不启内核:用户还没配置任何东西) ----------
-/etc/init.d/openbox-panel enable || warn "设置面板开机自启失败,可稍后在 LuCI → 服务 → Open-Box 中手动开启。"
+if [ "$PLATFORM" = "openwrt" ]; then
+  RETRY_HINT="可稍后在 LuCI → 服务 → Open-Box 中重试"
+else
+  RETRY_HINT="可稍后用 systemctl status openbox-panel 查看原因"
+fi
+"$PANEL_SVC" enable || warn "设置面板开机自启失败,$RETRY_HINT。"
 # procd 服务的返回码不总是可靠(见 openwrt/initd/openbox 注释),这里不把非零当作
 # 致命错误处理,只提醒用户自行确认面板是否可访问。
-/etc/init.d/openbox-panel start || warn "面板启动命令返回了非零状态,请稍后访问面板地址确认;如不可用可到 LuCI → 服务 → Open-Box 中重试。"
+"$PANEL_SVC" start || warn "面板启动命令返回了非零状态,请稍后访问面板地址确认;如不可用$RETRY_HINT。"
 
 # ---------- 完成 ----------
 # uci 里的 ipaddr 可能写成 CIDR(如 10.0.0.1/24),也可能是多值 list,
 # 这里统一取第一个地址并剥掉掩码后缀,否则拼出来的面板地址是坏的。
-LAN_IP=$(uci -q get network.lan.ipaddr 2>/dev/null | tr " " "\n" | head -n 1 | cut -d/ -f1)
+LAN_IP=""
+command -v uci >/dev/null 2>&1 && LAN_IP=$(uci -q get network.lan.ipaddr 2>/dev/null | tr " " "\n" | head -n 1 | cut -d/ -f1)
 if [ -z "$LAN_IP" ] && command -v ip >/dev/null 2>&1; then
   LAN_IP=$(ip -4 -o addr show br-lan 2>/dev/null | awk '{ print $4 }' | cut -d/ -f1 | head -n 1)
+fi
+# Debian / Ubuntu 没有 br-lan:取默认路由出口那块网卡的地址
+if [ -z "$LAN_IP" ] && command -v ip >/dev/null 2>&1; then
+  LAN_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.*src \([0-9.]*\).*/\1/p' | head -n 1)
 fi
 if [ -n "$LAN_IP" ]; then
   PANEL_URL="http://$LAN_IP:$PANEL_PORT"
@@ -823,7 +944,7 @@ echo "面板地址: $PANEL_URL"
 echo "首次打开面板需要设置管理密码。"
 # 命令行 open-box(见 openwrt/bin/open-box):忘了面板密码的人靠它找回,所以装完就告诉一声。
 # 软链接没建成(/usr/bin 下已有别人的同名文件、或文件系统只读)就给完整路径
-if [ -L /usr/bin/open-box ]; then
+if [ -L "$CLI_LINK" ]; then
   OPENBOX_CLI="open-box"
 elif [ -x "$INSTALL_ROOT/openwrt/bin/open-box" ]; then
   OPENBOX_CLI="$INSTALL_ROOT/openwrt/bin/open-box"
@@ -831,8 +952,17 @@ else
   OPENBOX_CLI=""
 fi
 if [ -n "$OPENBOX_CLI" ]; then
-  echo "以后忘了面板密码、或想检查升级:SSH 登上路由器后运行  $OPENBOX_CLI"
-  echo "  (菜单:1 当前密码 / 2 重新启动 / 3 检查升级 / 4 卸载 / 5 退出;LuCI → 服务 → Open-Box 页面也会显示密码)"
+  echo "以后忘了面板密码、或想检查升级:SSH 登上机器后运行  $OPENBOX_CLI"
+  if [ "$PLATFORM" = "openwrt" ]; then
+    echo "  (菜单:1 当前密码 / 2 重新启动 / 3 检查升级 / 4 卸载 / 5 退出;LuCI → 服务 → Open-Box 页面也会显示密码)"
+  else
+    echo "  (菜单:1 当前密码 / 2 重新启动 / 3 检查升级 / 4 卸载 / 5 退出)"
+  fi
 fi
-echo "如面板无法访问,可在路由器管理界面(LuCI)→ 服务 → Open-Box 中查看/重启服务,或使用紧急停止恢复直连。"
+if [ "$PLATFORM" = "openwrt" ]; then
+  echo "如面板无法访问,可在路由器管理界面(LuCI)→ 服务 → Open-Box 中查看/重启服务,或使用紧急停止恢复直连。"
+else
+  echo "如面板无法访问:systemctl status openbox-panel 看原因;紧急停止内核恢复直连:systemctl stop openbox。"
+  echo "Debian / Ubuntu 上没有 dnsmasq 分流(DNS 只有劫持模式)和 LuCI 页面;防火墙由你自己管理,内核起来时会打开 IP 转发。"
+fi
 echo ""

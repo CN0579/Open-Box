@@ -68,7 +68,7 @@ OpenWrt 上的一体化透明代理：安装包内置 Open-Box、sing-box 内核
 - **链式代理**：给住宅 / 静态 IP 这类出口（socks5 / http / https，可粘链接或分字段填写）指定一个前置节点或节点组，流量先经前置再到出口；建好后作为普通节点用在节点组、站点集和终端分流里。
 - **目标分流**：规则可以直接填写，也可以添加规则集链接。规则集链接和本地规则明细可以同时保留、同时生效，不会因为导入明细而删除原有链接。规则集链接每 24 小时随内核启动更新一次，链接旁的「立即更新」可以马上重拉，内核自动加载新内容。
 - **切换不重启内核**：站点集在直连和代理之间切换时只改写一份很小的「开关规则集」，内核不重启——已建立的连接不断（下载、视频、SSH 不受影响），新连接和 DNS 在 1 秒内按新线路走。只有设备没有 nftables 重定向（纯 tun）、切换又牵动入口旁路，或者分流设置改过还没重启内核时，才会自动重新部署并重启一次。
-- **屏蔽 QUIC**：后端设置里的开关（默认关）。打开后走代理线路的 QUIC（UDP 443）被拒绝，浏览器自动退回 TCP；直连的站点不受影响。
+- **屏蔽 QUIC**：后端设置里的开关（默认开）。走代理线路的 QUIC（UDP 443）被拒绝，浏览器自动退回 TCP；直连的站点不受影响。不少节点转发 UDP 很差，YouTube 等走 QUIC 反而卡，所以默认开着；节点 UDP 很好的可以关掉。
 - **规则集导入**：在站点集编辑窗口点击“导入规则”，输入规则列表地址后可以先预览解析结果，再把域名、域名后缀、关键词、IP/CIDR 等明细导入站点集。导入后的明细保存在本地，启动时不再依赖该远程规则链接。
 - **订阅分享**：可以选择要分享的节点，设置标题和域名/IP，协议前缀支持 HTTP 或 HTTPS；保存一次即可生成并关闭窗口。分享列表支持展开/收起，单条分享可以启用或停用，也可以复制链接、刷新和删除。
 - **DNS 接管**：支持接管 dnsmasq 转发、防火墙劫持和禁用三种模式，国内域名与代理域名可以分别解析。DNS 页有两个上游可改地址和协议（UDP / TCP）：「兜底直连 DNS」给直连域名用，部署时优先用 WAN 下发的 DNS，读不到才用它填的地址；「代理 DNS 上游」给走代理的域名用，内核经站点集选中的节点向它查询。哪个域名用哪个上游由站点集此刻的出口决定，不用单独配置；要把某个域名固定成某个 IP 或另一个域名，用「DNS 重写」。
@@ -84,8 +84,10 @@ OpenWrt 上的一体化透明代理：安装包内置 Open-Box、sing-box 内核
 
 请从 [GitHub Releases](https://github.com/liandu2024/Open-Box/releases/latest) 下载对应架构的完整安装包：
 
-- `x64`：x86_64 路由器
-- `arm64`：aarch64 路由器
+- `x64`：x86_64 路由器 / 主机
+- `arm64`：aarch64 路由器 / 主机
+
+同一份安装包既能装在 OpenWrt 上，也能装在 Debian / Ubuntu（systemd）上，安装脚本会自行识别（见[安装](#安装)末尾）。
 
 完整安装包包含 Open-Box、sing-box、Node 运行时和全部 GeoSite / GeoIP 数据。每个资产旁边都有 SHA256 校验文件。
 
@@ -110,6 +112,17 @@ curl -fsSL https://gh-proxy.com/raw.githubusercontent.com/liandu2024/Open-Box/ma
 安装要求：OpenWrt、x86_64 或 aarch64、至少 512MB 存储空间和 512MB 内存。安装 / 升级脚本会检查并尝试用 opkg 或 apk 补齐系统依赖（kmod-tun、kmod-nft-queue、kmod-nft-nat、kmod-veth、ip-full、ca-bundle）；软件源不通时只提示、不中断，可稍后按提示手动安装，设 `OPENBOX_SKIP_DEPS=1` 可跳过这一步。安装完成后，用浏览器打开脚本提示的 `http://<路由器局域网 IP>:<面板端口>` 地址，首次访问设置管理密码。
 
 安装完成后，用浏览器打开 `http://<路由器 LAN 地址>:<面板端口>`（安装脚本结束时会打印这个地址），**首次打开时设置面板密码**。以后忘了密码不用重装，见下面的[忘记面板密码](#忘记面板密码)。
+
+### Debian / Ubuntu
+
+同样的安装、升级、卸载命令也适用于 Debian / Ubuntu（需要 systemd；在 Ubuntu 24.04 上验证过），以 root 或 `sudo` 执行即可。脚本会识别系统：服务交给 systemd（`openbox.service` 内核、`openbox-panel.service` 面板），命令行 `open-box` 放在 `/usr/local/bin`，随包的 Node 是 OpenWrt 用的 musl 版，安装时会从 nodejs.org（不通时换 npmmirror）下载同版本的官方 glibc 版替换，所以安装机器要能访问其中之一。依赖用 apt 补齐（nftables、xz-utils、iproute2、ca-certificates），tun / nftables 内核模块随发行版内核自带。
+
+和 OpenWrt 的差别：
+
+- 没有 LuCI 页面，也没有 dnsmasq 分流模式——DNS 只有「防火墙劫持」和「关闭」两种；本机用 systemd-resolved 的话它的上游查询同样会被内核接管，不需要改 resolved 的配置。
+- 防火墙由你自己管理：脚本不会写任何放行规则。装了 ufw / firewalld 之类的话，要自己放行面板端口，以及（作为旁路由时）局域网到本机的转发。
+- 内核启动时会打开 IP 转发（`net.ipv4.ip_forward=1`，原来关着的话停止时关回去），这样局域网终端把网关 / DNS 指向这台机器就能走它分流；只给本机用的话不用管。
+- 排障看 `journalctl -u openbox -u openbox-panel`；紧急恢复直连 `systemctl stop openbox`。
 
 ## 修改面板端口
 
@@ -153,7 +166,7 @@ Open-Box v0.1.216
 
 ## 升级
 
-面板中可以从“设置 → 后端设置”检查更新，也可以通过 SSH 执行：
+面板中可以从“设置 → 后端设置”检查更新，也可以通过 SSH 执行（OpenWrt 与 Debian / Ubuntu 同一条命令）：
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/liandu2024/Open-Box/main/scripts/update.sh | sh

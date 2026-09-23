@@ -1,5 +1,6 @@
 #!/bin/sh
-# Open-Box 升级脚本(POSIX sh,兼容 OpenWrt ash)。
+# Open-Box 升级脚本(POSIX sh,兼容 OpenWrt ash 与 Debian dash)。OpenWrt 与 Debian / Ubuntu(systemd)都用它,
+# 系统相关的分叉见 detect_platform。
 #
 # 用法:
 #   sh update.sh                    # 沿用安装时选择的通道(记录在 data/channel)
@@ -102,6 +103,7 @@ openbox_env_report() {
     echo ""
     echo "---- 环境信息(反馈问题时请连同上面的错误一起贴出来)----"
     echo "固件: $(sed -n 's/^DISTRIB_DESCRIPTION=//p' /etc/openwrt_release 2>/dev/null | tr -d "\"'" | head -n 1)"
+    echo "系统: $(sed -n 's/^PRETTY_NAME=//p' /etc/os-release 2>/dev/null | tr -d "\"'" | head -n 1)  服务管理: $([ -d /run/systemd/system ] && echo systemd || echo procd)"
     echo "内核: $(uname -r 2>/dev/null)  架构: $(uname -m 2>/dev/null)"
     echo "安装目录: $INSTALL_ROOT"
     echo "$_er_root_parent 所在文件系统: $(awk -v d="$_er_root_parent" '{ mp=$2; if (mp=="/" || index(d"/", mp"/")==1) { if (length(mp) > bl) { bl=length(mp); best=$1" 挂在 "mp" ("$3", "$4")" } } } END { print best }' /proc/mounts 2>/dev/null)"
@@ -130,6 +132,52 @@ openbox_env_report() {
   return 0
 }
 # ---- openbox-env-report:end ----
+
+# ---- openbox-glibc-node:start ----
+# 这一段在 install.sh / update.sh 两份里**一模一样**,由 panel/server/system/script-parity.test.mjs 守着逐字相同。
+#
+# Debian / Ubuntu:发布包里的 Node 是 OpenWrt 用的 musl 版,glibc 系统上根本起不来(没有 musl 的加载器)。
+# 按 meta.json 里的 nodeVersion 从 nodejs.org(不通就换 npmmirror)取同一版本的官方 glibc 二进制,对着
+# SHASUMS256.txt 校验后只换 node/bin/node,再删掉 node/lib/(musl 版 libstdc++,glibc 的 Node 装上它会崩)。
+# 换过的目录留一个 node/.flavor 标记(glibc <版本>):已经是这个版本的 glibc Node 就什么都不做——升级时
+# 运行时组件没变,组件更新会把原来的 node/ 原样带过来。
+openbox_glibc_node() {
+  _gn_root="$1"
+  _gn_ver=$(sed -n 's/.*"nodeVersion" *: *"\([^"]*\)".*/\1/p' "$_gn_root/meta.json" 2>/dev/null | head -n 1)
+  _gn_arch=$(sed -n 's/.*"arch" *: *"\([^"]*\)".*/\1/p' "$_gn_root/meta.json" 2>/dev/null | head -n 1)
+  [ -n "$_gn_ver" ] && [ -n "$_gn_arch" ] || { echo "meta.json 里没有 nodeVersion / arch"; return 1; }
+  if [ -x "$_gn_root/node/bin/node" ] && [ "$(cat "$_gn_root/node/.flavor" 2>/dev/null)" = "glibc $_gn_ver" ]; then
+    return 0
+  fi
+  _gn_name="node-v$_gn_ver-linux-$_gn_arch"
+  _gn_tmp="$_gn_root/.node-glibc.$$"
+  rm -rf "$_gn_tmp"
+  mkdir -p "$_gn_tmp" || { echo "无法创建 $_gn_tmp"; return 1; }
+  _gn_ok=""
+  for _gn_base in "https://nodejs.org/dist/v$_gn_ver" "https://npmmirror.com/mirrors/node/v$_gn_ver"; do
+    echo "  从 $_gn_base 下载 $_gn_name.tar.xz ..." >&2
+    rm -f "$_gn_tmp/SHASUMS256.txt" "$_gn_tmp/$_gn_name.tar.xz"
+    fetch_to_file "$_gn_base/SHASUMS256.txt" "$_gn_tmp/SHASUMS256.txt" 2>/dev/null || continue
+    fetch_to_file "$_gn_base/$_gn_name.tar.xz" "$_gn_tmp/$_gn_name.tar.xz" 2>/dev/null || continue
+    _gn_want=$(grep " $_gn_name\.tar\.xz\$" "$_gn_tmp/SHASUMS256.txt" 2>/dev/null | awk '{print $1}' | head -n 1)
+    _gn_have=$(sha256sum "$_gn_tmp/$_gn_name.tar.xz" 2>/dev/null | awk '{print $1}')
+    if [ -n "$_gn_want" ] && [ "$_gn_want" = "$_gn_have" ]; then _gn_ok=1; break; fi
+    echo "  校验不符,换一个源" >&2
+  done
+  [ -n "$_gn_ok" ] || { rm -rf "$_gn_tmp"; echo "下载 glibc 版 Node $_gn_ver 失败(nodejs.org 与 npmmirror 都没拿到)"; return 1; }
+  if ! tar -xJf "$_gn_tmp/$_gn_name.tar.xz" -C "$_gn_tmp" "$_gn_name/bin/node"; then
+    rm -rf "$_gn_tmp"
+    echo "解包 $_gn_name.tar.xz 失败(缺 xz?)"
+    return 1
+  fi
+  mkdir -p "$_gn_root/node/bin"
+  mv -f "$_gn_tmp/$_gn_name/bin/node" "$_gn_root/node/bin/node" || { rm -rf "$_gn_tmp"; echo "替换 node/bin/node 失败"; return 1; }
+  chmod +x "$_gn_root/node/bin/node"
+  rm -rf "$_gn_root/node/lib" "$_gn_tmp"
+  printf 'glibc %s\n' "$_gn_ver" > "$_gn_root/node/.flavor"
+  return 0
+}
+# ---- openbox-glibc-node:end ----
 
 # ---- openbox-node-smoke:start ----
 # 随包的 Node 真的能在这台机器上跑起来吗?(GitHub #145)
@@ -679,7 +727,7 @@ done
 # 匹配的资产名)的判定逻辑,而不是只看 HTTP 状态码——这是唯一能把"200 但是个
 # HTML 错误页"的假死镜像识别出来的办法,见该函数定义处的注释。
 #
-# 特意不做 check_root/check_openwrt/check_installed:探测是纯只读操作,不修改任何
+# 特意不做 check_root/detect_platform/check_installed:探测是纯只读操作,不修改任何
 # 系统状态,也不要求已有安装存在——这样才能在非 OpenWrt 的开发机 / CI 上直接跑通
 # (构建验证阶段要用到);生产环境下这条路径仍然只会被 LuCI 通过 fs.exec 在真正
 # 装好的 OpenWrt 上调用,ACL 已经把 exec 权限限制在 /opt/open-box/update.sh 这一份
@@ -847,8 +895,24 @@ check_root() {
   [ "$(id -u)" = "0" ] || die "请以 root 身份运行本脚本。"
 }
 
-check_openwrt() {
-  [ -r /etc/openwrt_release ] || die "未检测到 OpenWrt 系统(缺少 /etc/openwrt_release)。"
+# 跑在哪种系统上。OpenWrt(procd / uci / LuCI)是原生形态;Debian / Ubuntu(systemd)2026-09 起也能装:
+# 服务由 systemd 管(debian/systemd/*.service),面板用 debian/bin/ 下的 systemctl 包装脚本代替 /etc/init.d,
+# 没有 LuCI、没有 dnsmasq 分流、防火墙自理(README 有说明)。两种都不是就拒绝。
+PLATFORM=""
+detect_platform() {
+  if [ -r /etc/openwrt_release ]; then
+    PLATFORM="openwrt"
+    CORE_SVC=/etc/init.d/openbox
+    PANEL_SVC=/etc/init.d/openbox-panel
+    CLI_LINK=/usr/bin/open-box
+  elif [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    PLATFORM="systemd"
+    CORE_SVC="$INSTALL_ROOT/debian/bin/openbox-ctl"
+    PANEL_SVC="$INSTALL_ROOT/debian/bin/openbox-panel-ctl"
+    CLI_LINK=/usr/local/bin/open-box
+  else
+    die "未检测到 OpenWrt(缺少 /etc/openwrt_release),也不是 systemd 系统。Open-Box 支持 OpenWrt 路由器和 Debian / Ubuntu(systemd)。"
+  fi
 }
 
 check_installed() {
@@ -1008,7 +1072,7 @@ write_status starting "" "" ""
 ENV_REPORT_ON=1
 info "预检..."
 check_root
-check_openwrt
+detect_platform
 check_installed
 map_arch
 cleanup_stale_stage_dirs
@@ -1038,7 +1102,20 @@ dep_ok() {
     kmod-veth) [ -d "$DEP_SYS_MODULE/veth" ] || modprobe veth >/dev/null 2>&1 ;;
     ip-full) ip netns list >/dev/null 2>&1 ;;
     ca-bundle) [ -s "$DEP_CA_BUNDLE" ] ;;
+    # 下面两个只在 Debian / Ubuntu 上检查:nft 命令装 Open-Box 自己的表,xz 解 nodejs.org 的 Node 包
+    nftables) command -v nft >/dev/null 2>&1 ;;
+    xz-utils) command -v xz >/dev/null 2>&1 ;;
     *) return 0 ;;
+  esac
+}
+# 依赖名按 OpenWrt 的包名写;Debian / Ubuntu 换成 apt 的包名,内核模块随发行版内核自带(没有单独的包,装不上只能提示)
+dep_pkg() {
+  [ "${_dep_pm:-}" = "apt-get" ] || { echo "$1"; return 0; }
+  case "$1" in
+    kmod-*) echo "" ;;
+    ip-full) echo "iproute2" ;;
+    ca-bundle) echo "ca-certificates" ;;
+    *) echo "$1" ;;
   esac
 }
 dep_effect() {
@@ -1048,6 +1125,8 @@ dep_effect() {
     kmod-nft-nat) echo "auto_redirect 转发规则加不上,退到兼容模式" ;;
     kmod-veth|ip-full) echo "规则页不能模拟 LAN 终端(可改用内核诊断)" ;;
     ca-bundle) echo "HTTPS 订阅和更新下载会因证书校验失败" ;;
+    nftables) echo "起内核前装不上 Open-Box 自己的 nft 表(进内核前放行 / 直连应答放行不生效)" ;;
+    xz-utils) echo "解不开 nodejs.org 的 Node 压缩包,面板跑不起来" ;;
   esac
 }
 ensure_dependencies() {
@@ -1056,6 +1135,7 @@ ensure_dependencies() {
     return 0
   fi
   _dep_all="kmod-tun kmod-nft-queue kmod-nft-nat kmod-veth ip-full ca-bundle"
+  [ "${PLATFORM:-openwrt}" = "systemd" ] && _dep_all="$_dep_all nftables xz-utils"
   _dep_missing=""
   for _d in $_dep_all; do dep_ok "$_d" || _dep_missing="$_dep_missing $_d"; done
   if [ -z "$_dep_missing" ]; then
@@ -1066,9 +1146,10 @@ ensure_dependencies() {
   _dep_verb=""
   if command -v opkg >/dev/null 2>&1; then _dep_pm=opkg; _dep_verb="opkg install"
   elif command -v apk >/dev/null 2>&1; then _dep_pm=apk; _dep_verb="apk add"
+  elif command -v apt-get >/dev/null 2>&1; then _dep_pm=apt-get; _dep_verb="apt-get install -y --no-install-recommends"; export DEBIAN_FRONTEND=noninteractive
   fi
   if [ -z "$_dep_pm" ]; then
-    warn "缺少系统依赖:${_dep_missing# };没找到 opkg / apk,请自行安装。"
+    warn "缺少系统依赖:${_dep_missing# };没找到 opkg / apk / apt-get,请自行安装。"
   else
     info "缺少系统依赖:${_dep_missing# },尝试用 $_dep_pm 安装(软件源不通时只提示,不中断)..."
     _dep_to=""
@@ -1076,7 +1157,9 @@ ensure_dependencies() {
     $_dep_to $_dep_pm update >/dev/null 2>&1 || warn "$_dep_pm update 失败(软件源不通?),仍尝试安装。"
     # 逐个装:一个装不上不连累其它(内核模块包要和当前内核版本一致,厂商固件常对不上)
     for _d in $_dep_missing; do
-      $_dep_to $_dep_verb "$_d" >/dev/null 2>&1 || true
+      _dep_pkg=$(dep_pkg "$_d")
+      [ -n "$_dep_pkg" ] || continue
+      $_dep_to $_dep_verb "$_dep_pkg" >/dev/null 2>&1 || true
     done
   fi
   _dep_still=""
@@ -1086,7 +1169,12 @@ ensure_dependencies() {
     return 0
   fi
   for _d in $_dep_still; do
-    warn "仍缺 $_d:$(dep_effect "$_d")。可稍后手动执行:${_dep_verb:-opkg install} $_d"
+    _dep_pkg=$(dep_pkg "$_d")
+    if [ -n "$_dep_pkg" ]; then
+      warn "仍缺 $_d:$(dep_effect "$_d")。可稍后手动执行:${_dep_verb:-opkg install} $_dep_pkg"
+    else
+      warn "仍缺 $_d:$(dep_effect "$_d")。这个内核模块应随系统内核自带,请检查内核配置(modprobe ${_d#kmod-} 的报错)。"
+    fi
   done
   return 0
 }
@@ -1229,8 +1317,8 @@ cleanup() {
   fi
   # 文件已经换过、面板还没拉起来就走到这里(比如铺 LuCI 文件时 die 了):无论如何把面板
   # 起来,用户至少还能进面板看到发生了什么;卡在"面板停着"是最糟的结局
-  if [ "${POST_SWAP:-0}" = "1" ] && [ "${PANEL_STARTED:-0}" != "1" ] && [ -x /etc/init.d/openbox-panel ]; then
-    /etc/init.d/openbox-panel start >/dev/null 2>&1 || true
+  if [ "${POST_SWAP:-0}" = "1" ] && [ "${PANEL_STARTED:-0}" != "1" ] && [ -x "${PANEL_SVC:-/etc/init.d/openbox-panel}" ]; then
+    "${PANEL_SVC:-/etc/init.d/openbox-panel}" start >/dev/null 2>&1 || true
   fi
   [ -n "${UPDATE_LOCK:-}" ] && rm -rf "$UPDATE_LOCK" 2>/dev/null
   return 0
@@ -1385,18 +1473,18 @@ rm -f "$CANCEL_FLAG" 2>/dev/null || true
 
 # 记住内核此刻是否在跑:升级完把它按新版本重新生成配置再拉起来,不用用户再进面板点启动
 CORE_WAS_RUNNING=0
-if [ -x /etc/init.d/openbox ] && /etc/init.d/openbox status 2>/dev/null | grep -q running; then
+if [ -x "$CORE_SVC" ] && "$CORE_SVC" status 2>/dev/null | grep -q running; then
   CORE_WAS_RUNNING=1
 fi
 
 info "停止服务..."
-if [ -x /etc/init.d/openbox-panel ]; then
-  /etc/init.d/openbox-panel stop >/dev/null 2>&1 || true
+if [ -x "$PANEL_SVC" ]; then
+  "$PANEL_SVC" stop >/dev/null 2>&1 || true
 fi
-if [ -x /etc/init.d/openbox ]; then
+if [ -x "$CORE_SVC" ]; then
   # 会顺带触发 P5 的安全清理(摘掉指向旧内核的 DNS 接管、移除 v6 拦截),
   # 这正是升级窗口期间希望的状态:内核马上要被换掉,不该让残留的接管卡住 LAN 上网。
-  /etc/init.d/openbox stop >/dev/null 2>&1 || true
+  "$CORE_SVC" stop >/dev/null 2>&1 || true
 fi
 
 info "替换 node/ panel/ bin/ openwrt/(保留 data/ 与 etc/)..."
@@ -1412,8 +1500,15 @@ POST_SWAP=1
 # 中途任何一步失败都整体回退:新的删掉、.old 挪回原位,现有安装回到升级前的样子。
 # 以前是换一个删一个 .old,第三个失败时前两个的旧版本已经没了,装置卡成半新半旧,
 # 只能手工修或重装。
-COMPONENTS="${UPDATE_COMPONENTS:-node panel bin openwrt}"
-INITD_DIR="${OPENBOX_INITD_DIR:-/etc/init.d}"
+COMPONENTS="${UPDATE_COMPONENTS:-node panel bin openwrt debian}"
+# init 脚本(OpenWrt)/ systemd 单元(Debian)铺到哪、叫什么:回退和铺装两处都按这两个变量走
+if [ "$PLATFORM" = "systemd" ]; then
+  INITD_DIR="${OPENBOX_INITD_DIR:-/etc/systemd/system}"
+  INITD_SUFFIX=".service"
+else
+  INITD_DIR="${OPENBOX_INITD_DIR:-/etc/init.d}"
+  INITD_SUFFIX=""
+fi
 SWAPPED_NEW=""
 rollback_components() {
   _rb_failed=""
@@ -1429,9 +1524,10 @@ rollback_components() {
   # init 脚本铺到一半失败的话,已经铺进去的也要换回旧的;meta.json 同理
   for _rb in openbox openbox-panel; do
     if [ -e "$STAGE_DIR/initd-backup/$_rb" ]; then
-      cp "$STAGE_DIR/initd-backup/$_rb" "$INITD_DIR/$_rb" || _rb_failed="$_rb_failed initd:$_rb"
+      cp "$STAGE_DIR/initd-backup/$_rb" "$INITD_DIR/$_rb$INITD_SUFFIX" || _rb_failed="$_rb_failed initd:$_rb"
     fi
   done
+  [ -n "$INITD_SUFFIX" ] && systemctl daemon-reload >/dev/null 2>&1
   if [ -e "$STAGE_DIR/initd-backup/meta.json" ]; then
     cp "$STAGE_DIR/initd-backup/meta.json" "$INSTALL_ROOT/meta.json" || _rb_failed="$_rb_failed meta.json"
   fi
@@ -1477,23 +1573,42 @@ fi
 # root(0);统一改回 0:0,避免残留一个陌生 uid(P6 终审 Minor)。
 chown -R 0:0 "$INSTALL_ROOT" || warn "重置 $INSTALL_ROOT 属主为 root 失败,可能不影响使用。"
 
+# Debian / Ubuntu:新换进来的 node/ 是 musl 版(或者组件更新原样带过来的 glibc 版,那样这一步什么都不做),
+# 趁 .old 还在、还能整体回退的时候换成 glibc 版
+if [ "$PLATFORM" = "systemd" ]; then
+  info "Debian / Ubuntu:检查 glibc 版 Node 运行时..."
+  if ! _gn_err=$(openbox_glibc_node "$INSTALL_ROOT"); then
+    [ -n "$_gn_err" ] && printf '%s\n' "$_gn_err" >&2
+    swap_failed "glibc 版 Node 没装上(请检查能否访问 nodejs.org 或 npmmirror.com)。"
+  fi
+fi
+
 info "重新铺装 init 脚本与 LuCI 文件..."
-# 先把现有 init 脚本存一份到暂存目录:铺到一半失败要连组件一起整体回退
+# 先把现有 init 脚本 / systemd 单元存一份到暂存目录:铺到一半失败要连组件一起整体回退
 mkdir -p "$STAGE_DIR/initd-backup" || swap_failed "无法创建 init 脚本备份目录。"
 for _initd in openbox openbox-panel; do
-  if [ -e "$INITD_DIR/$_initd" ]; then
-    cp "$INITD_DIR/$_initd" "$STAGE_DIR/initd-backup/$_initd" || swap_failed "无法备份现有的 $INITD_DIR/$_initd。"
+  if [ -e "$INITD_DIR/$_initd$INITD_SUFFIX" ]; then
+    cp "$INITD_DIR/$_initd$INITD_SUFFIX" "$STAGE_DIR/initd-backup/$_initd" || swap_failed "无法备份现有的 $INITD_DIR/$_initd$INITD_SUFFIX。"
   fi
 done
-cp "$INSTALL_ROOT/openwrt/initd/openbox" "$INITD_DIR/openbox" || swap_failed "无法安装 $INITD_DIR/openbox。"
-cp "$INSTALL_ROOT/openwrt/initd/openbox-panel" "$INITD_DIR/openbox-panel" || swap_failed "无法安装 $INITD_DIR/openbox-panel。"
-chmod +x "$INITD_DIR/openbox" "$INITD_DIR/openbox-panel"
+if [ "$PLATFORM" = "systemd" ]; then
+  chmod +x "$INSTALL_ROOT/debian/bin/"* "$INSTALL_ROOT/debian/shim/"* 2>/dev/null || true
+  cp "$INSTALL_ROOT/debian/systemd/openbox.service" "$INITD_DIR/openbox.service" || swap_failed "无法安装 $INITD_DIR/openbox.service。"
+  cp "$INSTALL_ROOT/debian/systemd/openbox-panel.service" "$INITD_DIR/openbox-panel.service" || swap_failed "无法安装 $INITD_DIR/openbox-panel.service。"
+  chmod 644 "$INITD_DIR/openbox.service" "$INITD_DIR/openbox-panel.service" 2>/dev/null || true
+  systemctl daemon-reload >/dev/null 2>&1 || warn "systemctl daemon-reload 失败,单元文件可能要等重启后才生效。"
+else
+  cp "$INSTALL_ROOT/openwrt/initd/openbox" "$INITD_DIR/openbox" || swap_failed "无法安装 $INITD_DIR/openbox。"
+  cp "$INSTALL_ROOT/openwrt/initd/openbox-panel" "$INITD_DIR/openbox-panel" || swap_failed "无法安装 $INITD_DIR/openbox-panel。"
+  chmod +x "$INITD_DIR/openbox" "$INITD_DIR/openbox-panel"
+fi
 # 组件和 init 脚本都换好了,这才是删旧版本的时候
 for comp in $COMPONENTS; do
   [ -e "$INSTALL_ROOT/$comp.old" ] && safe_rm_rf "$INSTALL_ROOT/$comp.old"
 done
 # ---- swap:end ----
 
+if [ "$PLATFORM" = "openwrt" ]; then
 mkdir -p /www/luci-static/resources/view/openbox || warn "无法创建 LuCI 视图目录(不影响面板本身,LuCI 页面可能是旧的)。"
 # 按目录拷,不写死文件名(理由同 install.sh:视图文件会改名来绕开浏览器缓存)
 cp "$INSTALL_ROOT/openwrt/luci/htdocs/luci-static/resources/view/openbox/"*.js \
@@ -1521,20 +1636,24 @@ fi
 cp "$_ACL_SRC" "$_ACL_DST" || warn "无法安装 rpcd ACL 文件(不影响面板本身,LuCI 页面可能是旧的)。"
 chmod 644 "$_ACL_DST" 2>/dev/null || true
 
-# 命令行 open-box(SSH 下看面板密码 / 检查升级)。不覆盖别人放在 /usr/bin/open-box 的真文件;建不了只警告。
-# 面板的 init 脚本每次启动也会补一次(从不认识这个文件的老版本升上来时靠它)
-if [ -f "$INSTALL_ROOT/openwrt/bin/open-box" ] && { [ ! -e /usr/bin/open-box ] || [ -L /usr/bin/open-box ]; }; then
+fi
+
+# 命令行 open-box(SSH 下看面板密码 / 检查升级)。OpenWrt 放 /usr/bin,Debian 放 /usr/local/bin(CLI_LINK)。
+# 不覆盖别人放在那里的真文件;建不了只警告。面板的 init 脚本每次启动也会补一次(从不认识这个文件的老版本升上来时靠它)
+if [ -f "$INSTALL_ROOT/openwrt/bin/open-box" ] && { [ ! -e "$CLI_LINK" ] || [ -L "$CLI_LINK" ]; }; then
   chmod +x "$INSTALL_ROOT/openwrt/bin/open-box" 2>/dev/null || true
-  ln -sf "$INSTALL_ROOT/openwrt/bin/open-box" /usr/bin/open-box 2>/dev/null || warn "无法创建 /usr/bin/open-box(不影响面板)。"
+  ln -sf "$INSTALL_ROOT/openwrt/bin/open-box" "$CLI_LINK" 2>/dev/null || warn "无法创建 $CLI_LINK(不影响面板)。"
 fi
 
 # 用 -rf 而不是 -f:OpenWrt <=22.03 的 Lua 版 LuCI 里 /tmp/luci-modulecache 是
 # 目录,rm -f 对目录返回非零,在 set -eu 下会直接中止脚本(P6 终审 Important 4)。
 # 菜单/视图文件的变化靠清缓存即可生效,不需要动 rpcd。
+if [ "$PLATFORM" = "openwrt" ]; then
 rm -rf /tmp/luci-*cache* 2>/dev/null || true
 if [ "$_acl_changed" = "1" ] && [ -x /etc/init.d/rpcd ]; then
   info "rpcd 权限文件有变化,重启 rpcd(LuCI 需要重新登录一次)..."
   /etc/init.d/rpcd restart >/dev/null 2>&1 || warn "重启 rpcd 失败,LuCI 页面权限可能要等下次重启路由器后才生效。"
+fi
 fi
 
 info "检查随包 Node 能否运行..."
@@ -1545,8 +1664,13 @@ if ! _ob_node_err=$(openbox_node_smoke); then
 fi
 
 info "启动面板..."
-/etc/init.d/openbox-panel enable || warn "设置面板开机自启失败,可稍后在 LuCI → 服务 → Open-Box 中手动开启。"
-/etc/init.d/openbox-panel start || warn "面板启动命令返回了非零状态,请稍后访问面板地址确认;如不可用可到 LuCI → 服务 → Open-Box 中重试。"
+if [ "$PLATFORM" = "openwrt" ]; then
+  RETRY_HINT="可稍后在 LuCI → 服务 → Open-Box 中重试"
+else
+  RETRY_HINT="可稍后用 systemctl status openbox-panel 查看原因"
+fi
+"$PANEL_SVC" enable || warn "设置面板开机自启失败,$RETRY_HINT。"
+"$PANEL_SVC" start || warn "面板启动命令返回了非零状态,请稍后访问面板地址确认;如不可用$RETRY_HINT。"
 PANEL_STARTED=1
 
 # 升级前内核在跑 → 现在按新版本重新生成配置并启动,走面板同款流水线(panel/server/cli/

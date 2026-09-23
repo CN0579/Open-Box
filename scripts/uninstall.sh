@@ -69,6 +69,7 @@ openbox_env_report() {
     echo ""
     echo "---- 环境信息(反馈问题时请连同上面的错误一起贴出来)----"
     echo "固件: $(sed -n 's/^DISTRIB_DESCRIPTION=//p' /etc/openwrt_release 2>/dev/null | tr -d "\"'" | head -n 1)"
+    echo "系统: $(sed -n 's/^PRETTY_NAME=//p' /etc/os-release 2>/dev/null | tr -d "\"'" | head -n 1)  服务管理: $([ -d /run/systemd/system ] && echo systemd || echo procd)"
     echo "内核: $(uname -r 2>/dev/null)  架构: $(uname -m 2>/dev/null)"
     echo "安装目录: $INSTALL_ROOT"
     echo "$_er_root_parent 所在文件系统: $(awk -v d="$_er_root_parent" '{ mp=$2; if (mp=="/" || index(d"/", mp"/")==1) { if (length(mp) > bl) { bl=length(mp); best=$1" 挂在 "mp" ("$3", "$4")" } } } END { print best }' /proc/mounts 2>/dev/null)"
@@ -211,14 +212,30 @@ check_root() {
   [ "$(id -u)" = "0" ] || die "请以 root 身份运行本脚本。"
 }
 
-check_openwrt() {
-  [ -r /etc/openwrt_release ] || die "未检测到 OpenWrt 系统(缺少 /etc/openwrt_release)。"
+# 跑在哪种系统上。OpenWrt(procd / uci / LuCI)是原生形态;Debian / Ubuntu(systemd)2026-09 起也能装:
+# 服务由 systemd 管(debian/systemd/*.service),面板用 debian/bin/ 下的 systemctl 包装脚本代替 /etc/init.d,
+# 没有 LuCI、没有 dnsmasq 分流、防火墙自理(README 有说明)。两种都不是就拒绝。
+PLATFORM=""
+detect_platform() {
+  if [ -r /etc/openwrt_release ]; then
+    PLATFORM="openwrt"
+    CORE_SVC=/etc/init.d/openbox
+    PANEL_SVC=/etc/init.d/openbox-panel
+    CLI_LINK=/usr/bin/open-box
+  elif [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    PLATFORM="systemd"
+    CORE_SVC="$INSTALL_ROOT/debian/bin/openbox-ctl"
+    PANEL_SVC="$INSTALL_ROOT/debian/bin/openbox-panel-ctl"
+    CLI_LINK=/usr/local/bin/open-box
+  else
+    die "未检测到 OpenWrt(缺少 /etc/openwrt_release),也不是 systemd 系统。Open-Box 支持 OpenWrt 路由器和 Debian / Ubuntu(systemd)。"
+  fi
 }
 
 # 卸载真正开工前打开环境信息(参数错误不打)
 ENV_REPORT_ON=1
 check_root
-check_openwrt
+detect_platform
 
 if [ ! -e "$INSTALL_ROOT" ]; then
   info "未检测到 Open-Box 安装($INSTALL_ROOT 不存在),无需卸载。"
@@ -274,13 +291,13 @@ write_status starting ""
 # 这里调用的是普通 stop,清理一定会跑。
 info "停止服务..."
 write_status stopping ""
-if [ -x /etc/init.d/openbox-panel ]; then
-  /etc/init.d/openbox-panel stop >/dev/null 2>&1 || true
-  /etc/init.d/openbox-panel disable >/dev/null 2>&1 || true
+if [ -x "$PANEL_SVC" ]; then
+  "$PANEL_SVC" stop >/dev/null 2>&1 || true
+  "$PANEL_SVC" disable >/dev/null 2>&1 || true
 fi
-if [ -x /etc/init.d/openbox ]; then
-  /etc/init.d/openbox stop >/dev/null 2>&1 || true
-  /etc/init.d/openbox disable >/dev/null 2>&1 || true
+if [ -x "$CORE_SVC" ]; then
+  "$CORE_SVC" stop >/dev/null 2>&1 || true
+  "$CORE_SVC" disable >/dev/null 2>&1 || true
 fi
 
 # ---------- 卸载独有的系统清理:移除面板放行规则 ----------
@@ -312,6 +329,12 @@ fi
 info "删除 init 脚本与 LuCI 文件..."
 write_status files ""
 rm -f /etc/init.d/openbox /etc/init.d/openbox-panel
+# Debian / Ubuntu:systemd 单元和 /usr/local/bin 下的命令行软链接
+if [ "$PLATFORM" = "systemd" ]; then
+  rm -f /etc/systemd/system/openbox.service /etc/systemd/system/openbox-panel.service
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  [ -L /usr/local/bin/open-box ] && rm -f /usr/local/bin/open-box
+fi
 # main.js 是现名,status.js 是 v0.1.215 及更早的旧名 —— 从老版本升上来的机器上两个都可能在,
 # 一个都不能留(留下的那个会让 LuCI 以为插件还在)。
 rm -f /www/luci-static/resources/view/openbox/main.js /www/luci-static/resources/view/openbox/status.js
