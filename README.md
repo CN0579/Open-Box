@@ -3,7 +3,14 @@
   <img src="docs/pic/logo.png" alt="Open-Box" height="72">
 </picture>
 
-OpenWrt 上的一体化透明代理：安装包内置 Open-Box、sing-box 内核、Node 运行时以及完整 GeoSite / GeoIP 数据，安装后通过浏览器完成订阅、节点、分流、DNS 和防火墙设置，不需要手写配置文件。
+路由器 / 主机上的一体化透明代理：安装包内置 Open-Box、sing-box 内核、Node 运行时以及完整 GeoSite / GeoIP 数据，安装后通过浏览器完成订阅、节点、分流、DNS 和防火墙设置，不需要手写配置文件。
+
+**支持的平台**
+
+- **OpenWrt**（含 iStoreOS、ImmortalWrt 等衍生固件）：x86_64、aarch64；主路由或旁路由都行，带 LuCI 页面
+- **Debian / Ubuntu**（需要 systemd；Ubuntu 24.04 验证过）：x86_64、aarch64；作为旁路由或只给本机用，没有 LuCI 和 dnsmasq 分流，见[安装](#安装)里的 Debian / Ubuntu 一节
+
+同一份安装包、同一条安装命令，脚本自己识别系统。
 
 ## 使用说明视频
 
