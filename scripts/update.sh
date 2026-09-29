@@ -157,6 +157,8 @@ openbox_glibc_node() {
   if [ -x "$_gn_root/node/bin/node" ] && [ "$(cat "$_gn_root/node/.flavor" 2>/dev/null)" = "glibc $_gn_ver" ]; then
     return 0
   fi
+  # 升级时复用的运行时在暂存目录里是指向现有安装的链接:在这里替换就直接改到了还没提交的现有安装
+  if [ -L "$_gn_root/node" ]; then echo "node 是指向现有安装的链接,不在这里替换"; return 1; fi
   _gn_name="node-v$_gn_ver-linux-$_gn_arch"
   _gn_tmp="$_gn_root/.node-glibc.$$"
   rm -rf "$_gn_tmp"
@@ -193,12 +195,40 @@ openbox_glibc_node() {
 # 「Check failed: 0 == ret.」这类启动即崩(页大小 / 地址空间 / 内存限制对不上)。不做这一步的话,
 # Node 起不来的机器上安装脚本照样打印"安装完成",用户只看到面板打不开、status 还显示 running
 # (procd 每 5 秒重拉一次),排查要绕一大圈。
-openbox_node_smoke() {
-  _ob_node="$INSTALL_ROOT/node/bin/node"
-  [ -x "$_ob_node" ] || { echo "缺少 $_ob_node"; return 1; }
+#
+# 内核缺 madvise 的设备(GitHub #290 #293:QWRT 等厂商固件编内核时关掉了 CONFIG_ADVISE_SYSCALLS):V8 一启动就
+# 「Check failed: 0 == ret.」。随包带了一个只接管 madvise 的兼容库(openwrt/bin/compat/,源码 scripts/node-compat/):
+# 直接跑不起来时带上它(LD_PRELOAD)再试一次,能跑就把库的路径记进 data/node-preload——面板服务、open-box 命令、
+# 升级脚本启动 Node 时照着带上;直接就能跑的删掉这个文件(换了固件的机器不再带)。
+#
+# 升级时在换入之前先试暂存目录里的新 Node($1 = 那份的根目录,不给就是安装目录):起不来就在动现有安装之前中止,
+# 不再等旧版本删掉之后才发现(审查第八项)。兼容库的路径按正式安装目录记,换入之后面板服务从那里加载。
+openbox_node_try() {
+  # $1:Node 所在的根目录;$2:要预加载的库,空 = 不带(显式清掉:面板发起的升级会从面板进程继承 LD_PRELOAD)
   # OPENSSL_CONF=/dev/null:不读系统的 OpenSSL 配置,有的固件那份写法随包 Node 解析不了(GitHub #265);面板服务也这样起
-  _ob_out=$(OPENSSL_CONF=/dev/null LD_LIBRARY_PATH="$INSTALL_ROOT/node/lib" "$_ob_node" -e 'process.stdout.write("ok")' 2>&1)
-  [ "$_ob_out" = "ok" ] && return 0
+  LD_PRELOAD="$2" OPENSSL_CONF=/dev/null LD_LIBRARY_PATH="$1/node/lib" "$1/node/bin/node" -e 'process.stdout.write("ok")' 2>&1
+}
+openbox_node_smoke() {
+  _ob_root="${1:-$INSTALL_ROOT}"
+  _ob_preload_file="$INSTALL_ROOT/data/node-preload"
+  [ -x "$_ob_root/node/bin/node" ] || { echo "缺少 $_ob_root/node/bin/node"; return 1; }
+  _ob_out=$(openbox_node_try "$_ob_root" "")
+  if [ "$_ob_out" = "ok" ]; then
+    rm -f "$_ob_preload_file"
+    return 0
+  fi
+  case "$(uname -m 2>/dev/null)" in
+    aarch64|arm64) _ob_lib="libobmadvise-aarch64.so" ;;
+    x86_64|amd64) _ob_lib="libobmadvise-x86_64.so" ;;
+    *) _ob_lib="" ;;
+  esac
+  if [ -n "$_ob_lib" ] && [ -f "$_ob_root/openwrt/bin/compat/$_ob_lib" ] && [ "$(openbox_node_try "$_ob_root" "$_ob_root/openwrt/bin/compat/$_ob_lib")" = "ok" ]; then
+    if mkdir -p "$INSTALL_ROOT/data" && printf '%s\n' "$INSTALL_ROOT/openwrt/bin/compat/$_ob_lib" > "$_ob_preload_file"; then
+      echo "[open-box] 这台设备的内核没有 madvise 系统调用,随包 Node 改用兼容库运行($INSTALL_ROOT/openwrt/bin/compat/$_ob_lib)。" >&2
+      return 0
+    fi
+    echo "无法写入 $_ob_preload_file"
+  fi
   echo "$_ob_out" | head -n 5
   # 动态链接器报缺符号 = 固件的 musl C 库太老(OpenWrt 21.02 及更早是 1.1.x,没有 pthread_getname_np 等),
   # 随包 Node 要 musl 1.2.3 以上;顺手把系统的版本号打出来,调用处据此提示升级固件
@@ -243,7 +273,7 @@ openbox_pick_tmp_parent() {
 # 真要用临时目录时才挑一次(挑不到就带着真实原因退出)。挑好后各处复用同一个 TMP_PARENT。
 ensure_tmp_parent() {
   [ -n "$TMP_PARENT" ] && return 0
-  TMP_PARENT=$(openbox_pick_tmp_parent) || die "找不到可写的临时目录(依次试过 ${OPENBOX_TMPDIR:+$OPENBOX_TMPDIR、}$(dirname -- "$INSTALL_ROOT")、/var/tmp、/root、/tmp)。最后一次的错误:${openbox_tmp_probe_err:-未知}。可用 OPENBOX_TMPDIR=<某个可写目录> 指定。"
+  TMP_PARENT=$(openbox_pick_tmp_parent) || die "找不到可写的临时目录(依次试过 ${OPENBOX_TMPDIR:+${OPENBOX_TMPDIR}、}$(dirname -- "$INSTALL_ROOT")、/var/tmp、/root、/tmp)。最后一次的错误:${openbox_tmp_probe_err:-未知}。可用 OPENBOX_TMPDIR=<某个可写目录> 指定。"
   case "$TMP_PARENT" in
     /tmp|/tmp/*) warn "$(dirname -- "$INSTALL_ROOT") 写不了,改用 $TMP_PARENT(它通常是内存盘,上百 MB 的包可能放不下;不行就用 OPENBOX_TMPDIR 指到一块有空间的磁盘)。" ;;
   esac
@@ -390,8 +420,8 @@ detect_downloader() {
 
 fetch_to_stdout() {
   case "$DOWNLOADER" in
-    curl) curl -fsSL "$1" ;;
-    wget) wget -qO- "$1" ;;
+    curl) curl -fsSL --connect-timeout 15 --max-time 60 "$1" ;;
+    wget) wget -q --timeout=60 -O - "$1" ;;
   esac
 }
 
@@ -422,6 +452,27 @@ fetch_to_file_probe() {
     curl) curl -fsSL --connect-timeout 8 --max-time 20 -o "$2" "$1" ;;
     wget) wget -q --timeout=20 -O "$2" "$1" ;;
   esac
+}
+
+# 校验文件(.sha256、组件清单,几十字节到几 KB)先直连 GitHub 取,取不到才走镜像:正文走镜像没关系,只要校验和
+# 来自 GitHub 本身,镜像就没法同时换掉正文和校验和(以前两样都从同一个镜像拿,审查第七项)。直连一次不通就记下来,
+# 后面的小文件不再先试直连,免得每个都白等一次超时。$1 是 GitHub 原始地址(不带镜像前缀);$3 可选,给了就按它
+# 核对内容格式(sha = 一行 64 位十六进制哈希),不像样的当没取到(有的网络对直连回一页 HTML)
+TRUSTED_DIRECT_BROKEN=0
+fetch_to_file_trusted() {
+  if [ "$CHANNEL" = "mirror" ] && [ "$TRUSTED_DIRECT_BROKEN" = "0" ]; then
+    if fetch_to_file_probe "$1" "$2" 2>/dev/null && { [ "${3:-}" != "sha" ] || valid_sha_file "$2"; }; then
+      return 0
+    fi
+    TRUSTED_DIRECT_BROKEN=1
+  fi
+  fetch_to_file "$(build_url "$1")" "$2"
+}
+valid_sha_file() {
+  _vs_hash=$(awk 'NR==1{print $1}' "$1" 2>/dev/null)
+  [ "${#_vs_hash}" = 64 ] || return 1
+  case "$_vs_hash" in *[!0-9a-fA-F]*) return 1 ;; esac
+  return 0
 }
 
 # 探测目标 URL 的 Content-Length(HEAD 请求,带超时,不下载正文),供下载进度的
@@ -461,9 +512,10 @@ download_with_progress() {
   _dwp_out="$2"
   _dwp_total="$3"
   rm -f "$_dwp_out"
+  # 同 install.sh 的 fetch_to_file:不限总时长,卡住不动 60 秒就失败(以前会一直挂在「下载中」)
   case "$DOWNLOADER" in
-    curl) curl -fsSL -o "$_dwp_out" "$_dwp_url" & ;;
-    wget) wget -q -O "$_dwp_out" "$_dwp_url" & ;;
+    curl) curl -fsSL --connect-timeout 15 --speed-limit 1024 --speed-time 60 -o "$_dwp_out" "$_dwp_url" & ;;
+    wget) wget -q --timeout=60 -O "$_dwp_out" "$_dwp_url" & ;;
   esac
   _dwp_pid=$!
   write_status downloading 0 "$_dwp_total" ""
@@ -897,6 +949,11 @@ if [ "$DETACH" = "1" ]; then
     && systemd-run --scope --quiet true >/dev/null 2>&1; then
     OPENBOX_UPDATE_CHANNEL_OVERRIDE="$CHANNEL_OVERRIDE" OPENBOX_UPDATE_MIRROR_PREFIX="$CLI_MIRROR_PREFIX" OPENBOX_UPDATE_EXPECT="$EXPECT_VERSION" OPENBOX_UPDATE_DISPATCHED=1 \
       systemd-run --scope --quiet --description="Open-Box update" setsid sh "$0" >"$UPDATE_LOG" 2>&1 </dev/null &
+  elif [ ! -r /etc/openwrt_release ] && grep -q 'openbox-panel\.service' /proc/self/cgroup 2>/dev/null; then
+    # 挪不出面板的 cgroup(没有 systemd-run、容器里建不了 scope……):退回 setsid 的话 worker 还在面板服务里,
+    # 下面「停止服务」停面板时会被一起结束,文件一个没换、面板也停着(审查第九项)。宁可不升,让用户在 SSH 里跑
+    { echo "stage=failed"; echo "message=没法把升级进程挪出面板服务(systemd-run --scope 不可用),请 SSH 登录后运行 open-box update"; } > "$STATUS_PATH" 2>/dev/null || true
+    die "没法把升级进程挪出面板服务(systemd-run --scope 不可用),在面板里升级会在停面板时被一起结束。请 SSH 登录后运行:open-box update"
   elif command -v setsid >/dev/null 2>&1; then
     OPENBOX_UPDATE_CHANNEL_OVERRIDE="$CHANNEL_OVERRIDE" OPENBOX_UPDATE_MIRROR_PREFIX="$CLI_MIRROR_PREFIX" OPENBOX_UPDATE_EXPECT="$EXPECT_VERSION" OPENBOX_UPDATE_DISPATCHED=1 \
       setsid sh "$0" >"$UPDATE_LOG" 2>&1 </dev/null &
@@ -1091,7 +1148,7 @@ if ! mkdir "$UPDATE_LOCK" 2>/dev/null; then
     die "已有一次更新在进行中(pid $_lock_pid),请等它结束或先取消。"
   fi
   rm -rf "$UPDATE_LOCK" 2>/dev/null
-  mkdir "$UPDATE_LOCK" 2>/dev/null || die "无法创建更新锁 $UPDATE_LOCK。"
+  mkdir "$UPDATE_LOCK" 2>/dev/null || die "无法创建更新锁 ${UPDATE_LOCK}。"
 fi
 echo "$$" > "$UPDATE_LOCK/pid" 2>/dev/null || true
 # 派发进程在 fork 之前已经清过一次取消标志;这里再清会把"派发到 worker 启动之间"到达的
@@ -1220,19 +1277,21 @@ detect_downloader
 # 校验、解包都完成后才从 meta.json 读出来(见下方),所以"是否已是最新版本"的判断
 # 也相应挪到了解包之后——这是放弃 API 查询换来的必然代价:多了一次下载,但镜像通道
 # 从此能用。
-# 没给 --expect 就直连 GitHub 看一眼 releases/latest 的 302 指向哪个 tag(几十字节,
-# 8 秒超时;直连不通就算了)。拿到 tag 才能用带版本号的资产名。
-resolve_latest_tag() {
-  _rlt_url="https://github.com/$REPO/releases/latest"
+# 没给 --expect 就看一眼 releases/latest 的 302 指向哪个 tag(几十字节,12 秒超时)。拿到 tag 才能用带版本号的
+# 资产名,解包后也才能核对版本——拿不到就只能用会动的 releases/latest/download,镜像缓存了旧包也发现不了。
+# 先直连;直连不通、走的是镜像通道时再经镜像问一次(国内直连 GitHub 常常不通,以前只问直连,定时自动更新探到
+# 新版本也会因为这里拿不到 tag 而装回镜像缓存的旧包,审查第六项)。
+resolve_latest_tag_from() {
   case "$DOWNLOADER" in
-    curl) curl -sI --connect-timeout 8 --max-time 12 "$_rlt_url" 2>/dev/null ;;
+    curl) curl -sI --connect-timeout 8 --max-time 12 "$1" 2>/dev/null ;;
     # OpenWrt 自带的 wget 是 uclient-fetch,没有 -S / --max-redirect(错误会被吞掉,
     # 静默退回稳定资产名,镜像缓存旧包的问题就回来了):改为跟着 302 把 releases/latest
     # 的页面拉下来,从里面的 /releases/tag/<tag> 链接取版本号
     # 页面里还有 /releases/tag/*name 这种模板链接,只认 v 开头的版本号
-    wget) wget -q -O - --timeout=12 "$_rlt_url" 2>/dev/null | sed -n 's|.*/releases/tag/\(v[0-9][0-9A-Za-z._-]*\).*|\1|p' | head -n 1 ;;
+    wget) wget -q -O - --timeout=12 "$1" 2>/dev/null | sed -n 's|.*/releases/tag/\(v[0-9][0-9A-Za-z._-]*\).*|\1|p' | head -n 1 ;;
   esac | sed -n 's/^[Ll]ocation: .*\/releases\/tag\/\(v[0-9][0-9A-Za-z._-]*\).*/\1/p; /^v[0-9][0-9A-Za-z._-]*$/p' | head -n 1
 }
+LATEST_URL="https://github.com/$REPO/releases/latest"
 # Compare plain numeric semver tags without depending on sort -V (not available in
 # every BusyBox build). Returns success when $1 is older than $2.
 version_less_than() {
@@ -1269,20 +1328,18 @@ resolve_previous_tag() {
   printf '%s\n' "$_rpt_best"
 }
 
-if [ -z "$EXPECT_VERSION" ] && [ "$ROLLBACK_MODE" = "0" ]; then
-  EXPECT_VERSION=$(resolve_latest_tag)
-  case "$EXPECT_VERSION" in
-    *[!A-Za-z0-9._-]*) EXPECT_VERSION="" ;;
-  esac
-fi
-if [ -n "$EXPECT_VERSION" ]; then
-  ASSET="open-box-${EXPECT_VERSION}-linux-${ARCH}.tar.gz"
-  ASSET_URL="https://github.com/$REPO/releases/download/${EXPECT_VERSION}/$ASSET"
-else
-  ASSET="open-box-linux-${ARCH}.tar.gz"
-  ASSET_URL="https://github.com/$REPO/releases/latest/download/$ASSET"
-fi
-SHA_URL="$ASSET_URL.sha256"
+# 资产地址:有版本号就用带版本号的资产名。版本号要等选好镜像之后才探(见下方),探到了再重算一次
+set_asset_urls() {
+  if [ -n "$EXPECT_VERSION" ]; then
+    ASSET="open-box-${EXPECT_VERSION}-linux-${ARCH}.tar.gz"
+    ASSET_URL="https://github.com/$REPO/releases/download/${EXPECT_VERSION}/$ASSET"
+  else
+    ASSET="open-box-linux-${ARCH}.tar.gz"
+    ASSET_URL="https://github.com/$REPO/releases/latest/download/$ASSET"
+  fi
+  SHA_URL="$ASSET_URL.sha256"
+}
+set_asset_urls
 
 OLD_VERSION=$(sed -n 's/.*"version" *: *"\([^"]*\)".*/\1/p' "$INSTALL_ROOT/meta.json" 2>/dev/null | head -n 1)
 
@@ -1367,6 +1424,22 @@ if [ "$CHANNEL" = "mirror" ] && [ -z "$MIRROR_PREFIX" ]; then
   select_builtin_mirror
 fi
 
+# 没给 --expect 就在这里探最新版本号:镜像已经选好,直连不通时可以经镜像问。直连探不到也说明直连 GitHub 不通,
+# 后面的校验文件就不先试直连了(fetch_to_file_trusted),免得每个都白等一次超时
+if [ -z "$EXPECT_VERSION" ] && [ "$ROLLBACK_MODE" = "0" ]; then
+  EXPECT_VERSION=$(resolve_latest_tag_from "$LATEST_URL")
+  if [ -z "$EXPECT_VERSION" ]; then
+    TRUSTED_DIRECT_BROKEN=1
+    if [ "$CHANNEL" = "mirror" ] && [ -n "$MIRROR_PREFIX" ]; then
+      EXPECT_VERSION=$(resolve_latest_tag_from "$(build_url "$LATEST_URL")")
+    fi
+  fi
+  case "$EXPECT_VERSION" in
+    *[!A-Za-z0-9._-]*) EXPECT_VERSION="" ;;
+  esac
+  set_asset_urls
+fi
+
 if [ "$ROLLBACK_MODE" = "1" ]; then
   [ -n "$OLD_VERSION" ] || die "无法读取当前安装版本,不能自动寻找上一个 Release。"
   info "正在查找 $OLD_VERSION 的上一个 GitHub Release..."
@@ -1374,7 +1447,7 @@ if [ "$ROLLBACK_MODE" = "1" ]; then
   ASSET="open-box-${EXPECT_VERSION}-linux-${ARCH}.tar.gz"
   ASSET_URL="https://github.com/$REPO/releases/download/${EXPECT_VERSION}/$ASSET"
   SHA_URL="$ASSET_URL.sha256"
-  info "将从 $OLD_VERSION 回退到 $EXPECT_VERSION。"
+  info "将从 $OLD_VERSION 回退到 ${EXPECT_VERSION}。"
 fi
 
 # releases/latest/download/<资产> 是个**会动的指针**:106MB 正文要下几分钟,几十字节的
@@ -1396,28 +1469,41 @@ if [ -n "$EXPECT_VERSION" ] && [ -n "$OLD_VERSION" ] && [ "$OLD_VERSION" = "$EXP
   write_status done "" "" "已是最新版本,无需升级"
   exit 0
 fi
+# 探到的「最新版本」比装着的还旧:镜像缓存了旧的 releases/latest 跳转,或者面板探版本号时拿到的是旧的。
+# 这不是升级,也不该悄悄降级(要回旧版本用 --rollback)
+if [ "$ROLLBACK_MODE" = "0" ] && [ -n "$EXPECT_VERSION" ] && [ -n "$OLD_VERSION" ] && version_less_than "$EXPECT_VERSION" "$OLD_VERSION"; then
+  info "探到的最新版本 $EXPECT_VERSION 比当前的 $OLD_VERSION 还旧(镜像缓存了旧的版本信息?),不降级。"
+  write_status done "" "" "当前版本比探到的最新版本还新,无需升级"
+  exit 0
+fi
 
+# 组件升级要用装着的 Node 核对清单:它自己跑不起来(文件坏了、换过固件、缺库……)时直接改用完整安装包,
+# 不然清单那一步就中止了,连 --rollback 都用不了(审查第八、十四项)
 if [ -f "$INSTALL_ROOT/panel/server/system/update-components.sh" ]; then
-  . "$INSTALL_ROOT/panel/server/system/update-components.sh"
-  if prepare_component_update; then _COMPONENT_PREPARED=1; fi
+  if [ "$(openbox_node_try "$INSTALL_ROOT" "$(cat "$INSTALL_ROOT/data/node-preload" 2>/dev/null || true)")" = "ok" ]; then
+    . "$INSTALL_ROOT/panel/server/system/update-components.sh"
+    if prepare_component_update; then _COMPONENT_PREPARED=1; fi
+  else
+    warn "当前安装的 Node 跑不起来,改用完整安装包升级。"
+  fi
 fi
 if [ "$_COMPONENT_PREPARED" = "0" ]; then
 _dl_round=0
 while :; do
   _dl_round=$((_dl_round + 1))
 
-  fetch_to_file "$(build_url "$SHA_URL")" "$TMP_DL/$ASSET.sha256.pre" || die "下载校验文件失败:$SHA_URL。现有安装未改动。"
+  fetch_to_file_trusted "$SHA_URL" "$TMP_DL/$ASSET.sha256.pre" sha || die "下载校验文件失败:${SHA_URL}。现有安装未改动。"
   check_cancel_and_abort
 
   info "下载发布包:$ASSET"
   ASSET_DL_URL=$(build_url "$ASSET_URL")
   ASSET_TOTAL=$(probe_content_length "$ASSET_DL_URL")
   case "$ASSET_TOTAL" in ''|*[!0-9]*) ASSET_TOTAL='' ;; esac
-  download_with_progress "$ASSET_DL_URL" "$TMP_DL/$ASSET" "$ASSET_TOTAL" || die "下载升级包失败:$ASSET_URL。现有安装未改动。"
+  download_with_progress "$ASSET_DL_URL" "$TMP_DL/$ASSET" "$ASSET_TOTAL" || die "下载升级包失败:${ASSET_URL}。现有安装未改动。"
 
   check_cancel_and_abort
 
-  fetch_to_file "$(build_url "$SHA_URL")" "$TMP_DL/$ASSET.sha256" || die "下载校验文件失败:$SHA_URL。现有安装未改动。"
+  fetch_to_file_trusted "$SHA_URL" "$TMP_DL/$ASSET.sha256" sha || die "下载校验文件失败:${SHA_URL}。现有安装未改动。"
 
   check_cancel_and_abort
 
@@ -1466,7 +1552,7 @@ mkdir -p "$STAGE_DIR" || die "无法在 $INSTALL_ROOT 下创建暂存目录(权�
 extract_tgz "$TMP_DL/$ASSET" "$STAGE_DIR" || die "解包失败。现有安装未改动。"
 fi # 完整包 / 按需组件均已在 STAGE_DIR 准备好
 for must in node panel bin openwrt meta.json; do
-  [ -e "$STAGE_DIR/$must" ] || die "升级包内容不完整,缺少 $must。现有安装未改动。"
+  [ -e "$STAGE_DIR/$must" ] || die "升级包内容不完整,缺少 ${must}。现有安装未改动。"
 done
 
 # 这是最后一个可以安全取消的检查点:再往下就要读版本号、决定是否进入停服务/
@@ -1479,6 +1565,10 @@ NEW_VERSION=$(sed -n 's/.*"version" *: *"\([^"]*\)".*/\1/p' "$STAGE_DIR/meta.jso
 if [ -n "$EXPECT_VERSION" ] && [ "$NEW_VERSION" != "$EXPECT_VERSION" ]; then
   die "下载到的包是 $NEW_VERSION,不是期望的 $EXPECT_VERSION(镜像缓存了旧包?换「GitHub 直连」通道再试)。现有安装未改动。"
 fi
+# 没探到版本号时用的是会动的 releases/latest/download:镜像缓存的旧包连同它的校验和一起对得上,不拦就会悄悄降级
+if [ "$ROLLBACK_MODE" = "0" ] && [ -n "$OLD_VERSION" ] && version_less_than "$NEW_VERSION" "$OLD_VERSION"; then
+  die "下载到的包是 $NEW_VERSION,比当前的 $OLD_VERSION 还旧(镜像缓存了旧包?),不降级;要回到旧版本请用 --rollback。现有安装未改动。"
+fi
 if [ "$_COMPONENT_PREPARED" = "0" ] && [ -n "$OLD_VERSION" ] && [ "$OLD_VERSION" = "$NEW_VERSION" ]; then
   info "当前已是最新版本($OLD_VERSION),无需升级。"
   write_status done "" "" "已是最新版本,无需升级"
@@ -1488,6 +1578,25 @@ if [ -n "$OLD_VERSION" ]; then
   info "$OLD_VERSION → $NEW_VERSION"
 else
   info "升级到 $NEW_VERSION"
+fi
+
+# ---------- 新版本的 Node 先在暂存目录里试(现有安装和服务都还没动)----------
+# 以前是换完文件、删掉旧版本之后才试,新 Node 起不来(固件太老、缺库、页大小不对)就只能停在半路,回也回不去
+# (审查第八项)。Debian / Ubuntu 的 glibc 版 Node 也在这里换进暂存目录:运行时组件没变时暂存目录里的 node
+# 就是装着的那份(链接),openbox_glibc_node 看到版本对得上什么都不做
+if [ "$PLATFORM" = "systemd" ]; then
+  info "Debian / Ubuntu:检查 glibc 版 Node 运行时..."
+  if ! _gn_err=$(openbox_glibc_node "$STAGE_DIR"); then
+    [ -n "$_gn_err" ] && printf '%s\n' "$_gn_err" >&2
+    die "glibc 版 Node 没装上(请检查能否访问 nodejs.org 或 npmmirror.com)。现有安装未改动。"
+  fi
+fi
+info "检查新版本的 Node 能否运行..."
+if ! _ob_node_err=$(openbox_node_smoke "$STAGE_DIR"); then
+  warn "新版本随包的 Node 在这台设备上起不来:"
+  [ -n "$_ob_node_err" ] && printf '%s\n' "$_ob_node_err" >&2
+  case "$_ob_node_err" in *"symbol not found"*) die "固件太老,请升级到 OpenWrt 24 以上。现有安装未改动。" ;; esac
+  die "新版本的面板在这台设备上跑不起来,升级中止,现有安装未改动。请把上面几行连同 uname -a、cat /etc/openwrt_release、head -3 /proc/meminfo 的输出发到 GitHub issue。"
 fi
 
 # ---------- 校验并解包成功之后,才允许停服务、动现有安装 ----------
@@ -1527,7 +1636,8 @@ POST_SWAP=1
 # 两阶段替换 + 整体回退:
 #   1) 先把四个旧组件各自挪到 .old(全部挪完之前一个都不删);
 #   2) 再把四个新组件从暂存目录挪进来;
-#   3) init 脚本也铺完、确认都成功后,才统一删 .old(见下方 swap:end)。
+#   3) init 脚本也铺完、新版本的面板起来并应答 /api/health 之后,才统一删 .old(见下方「面板起来了才删旧版本」);
+#      面板起不来就整体回退到旧版本(审查第八项)。
 # 中途任何一步失败都整体回退:新的删掉、.old 挪回原位,现有安装回到升级前的样子。
 # 以前是换一个删一个 .old,第三个失败时前两个的旧版本已经没了,装置卡成半新半旧,
 # 只能手工修或重装。
@@ -1562,11 +1672,52 @@ rollback_components() {
   if [ -e "$STAGE_DIR/initd-backup/meta.json" ]; then
     cp "$STAGE_DIR/initd-backup/meta.json" "$INSTALL_ROOT/meta.json" || _rb_failed="$_rb_failed meta.json"
   fi
+  for _rb in update.sh uninstall.sh; do
+    if [ -e "$STAGE_DIR/initd-backup/$_rb" ]; then
+      cp -p "$STAGE_DIR/initd-backup/$_rb" "$INSTALL_ROOT/$_rb" || _rb_failed="$_rb_failed $_rb"
+    fi
+  done
   [ -z "$_rb_failed" ]
 }
+
+# 升级前内核在跑 → 按(当时装着的)版本重新生成配置并启动,走面板同款流水线(panel/server/cli/
+# deploy.mjs:冲突检测 → 规则集 → 校验 → 落盘 → DNS 接管 → 防火墙 → 启动 → 验证)。
+# 绝不能退回 init 脚本直接起旧配置:停内核时 DNS 接管已被还原,不经流水线重新接管就把内核
+# 拉起来,dnsmasq 模式下路由器自己的 DNS 会在 dnsmasq 和内核之间打环、什么都解析不了
+# (开发路由器实测)。那个版本没有这个脚本(只会是降级到老版本)就保持停止,提示去面板点启动。
+# 新版本面板起不来、或者换文件途中失败,整体回退之后也走这里,把旧版本的内核拉起来。结果写进 CORE_MSG
+# (定义放在换文件之前:swap_failed 在换文件途中就会调它)
+restart_core() {
+  CORE_MSG="内核未自动重启——如之前配置并运行着代理服务,请到面板重新启动它。"
+  [ "$CORE_WAS_RUNNING" = "1" ] || return 0
+  DEPLOY_CLI="$INSTALL_ROOT/panel/server/cli/deploy.mjs"
+  if [ -x "$INSTALL_ROOT/node/bin/node" ] && [ -f "$DEPLOY_CLI" ]; then
+    # 面板这时已经起来了,前端能重新读到状态文件:给内核重启单独一个阶段,否则弹窗
+    # 一直停在"正在替换文件,面板即将重启…",用户不知道后面还有一次内核重启(约 20 秒)。
+    write_status restarting_core "" "" "面板已重启,正在重新生成配置并启动内核"
+    info "升级前内核在运行,重新生成配置并启动内核..."
+    # LD_PRELOAD:内核缺 madvise 的设备上 Node 要带兼容库(冒烟测试记在 data/node-preload,没有就是空)
+    if OPENBOX_ROOT="$INSTALL_ROOT" ZASHBOARD_DB_PATH="$INSTALL_ROOT/data/openbox.sqlite" \
+       LD_PRELOAD="$(cat "$INSTALL_ROOT/data/node-preload" 2>/dev/null)" \
+       OPENSSL_CONF=/dev/null LD_LIBRARY_PATH="$INSTALL_ROOT/node/lib" "$INSTALL_ROOT/node/bin/node" "$DEPLOY_CLI" >/dev/null 2>&1; then
+      CORE_MSG="内核已重新生成配置并启动。"
+    else
+      warn "内核启动失败(配置生成或校验没通过),请到面板查看原因后重新启动。"
+      CORE_MSG="内核启动失败,请到面板查看原因后重新启动。"
+    fi
+  else
+    warn "这个版本没有自动启动内核的脚本,请到面板重新启动内核。"
+    CORE_MSG="这个版本没有自动启动内核的脚本,请到面板重新启动内核。"
+  fi
+}
+
 swap_failed() {
   if rollback_components; then
-    die "$1 已把 node/ panel/ bin/ openwrt/ 与 init 脚本整体回退到升级前的版本,现有安装应仍完整($INSTALL_ROOT);请检查磁盘空间与权限后重试。"
+    # 旧版本的面板和内核拉回来:面板以前靠退出时的 cleanup 拉,内核没人管,升级前在跑的就一直停着
+    "$PANEL_SVC" start >/dev/null 2>&1 || true
+    PANEL_STARTED=1
+    restart_core
+    die "$1 已把 node/ panel/ bin/ openwrt/ 与 init 脚本整体回退到升级前的版本,现有安装应仍完整($INSTALL_ROOT);${CORE_MSG}请检查磁盘空间与权限后重试。"
   fi
   die "$1 回退时也失败了(没能挪回:$_rb_failed),安装现处于不一致状态:请检查 $INSTALL_ROOT 下各组件与对应的 .old 目录,必要时手工把 .old 挪回原名,或重新运行 update.sh。"
 }
@@ -1575,7 +1726,7 @@ for comp in $COMPONENTS; do
 done
 for comp in $COMPONENTS; do
   if [ -e "$INSTALL_ROOT/$comp" ]; then
-    mv "$INSTALL_ROOT/$comp" "$INSTALL_ROOT/$comp.old" || swap_failed "无法备份旧的 $comp。"
+    mv "$INSTALL_ROOT/$comp" "$INSTALL_ROOT/$comp.old" || swap_failed "无法备份旧的 ${comp}。"
   fi
 done
 for comp in $COMPONENTS; do
@@ -1585,7 +1736,12 @@ done
 # meta.json 也留一份:回退后版本号要跟组件一致,不能旧组件挂着新版本号
 mkdir -p "$STAGE_DIR/initd-backup" || swap_failed "无法创建备份目录。"
 [ -e "$INSTALL_ROOT/meta.json" ] && { cp "$INSTALL_ROOT/meta.json" "$STAGE_DIR/initd-backup/meta.json" || swap_failed "无法备份 meta.json。"; }
-mv "$STAGE_DIR/meta.json" "$INSTALL_ROOT/meta.json" || warn "meta.json 替换失败,面板显示的版本号可能不准确,但不影响功能。"
+# 换不上就整体回退:组件已经是新的,meta 还是旧的的话版本号、组件核对(下次升级按它算复用)都会错(GPT 复核第四项)
+mv "$STAGE_DIR/meta.json" "$INSTALL_ROOT/meta.json" || swap_failed "替换 meta.json 失败。"
+# 升级 / 卸载脚本也备一份:新版本面板起不来要整体回退时一起换回去(rollback_components)
+for _script in update.sh uninstall.sh; do
+  [ -e "$INSTALL_ROOT/$_script" ] && { cp -p "$INSTALL_ROOT/$_script" "$STAGE_DIR/initd-backup/$_script" || swap_failed "无法备份 ${_script}。"; }
+done
 # uninstall.sh 随产物分发(LuCI 兜底页要调它),升级时一并刷新,免得留着旧版本的
 # 卸载逻辑去清理新版本铺下的东西。
 if [ -e "$STAGE_DIR/uninstall.sh" ]; then
@@ -1604,22 +1760,13 @@ fi
 # root(0);统一改回 0:0,避免残留一个陌生 uid(P6 终审 Minor)。
 chown -R 0:0 "$INSTALL_ROOT" || warn "重置 $INSTALL_ROOT 属主为 root 失败,可能不影响使用。"
 
-# Debian / Ubuntu:新换进来的 node/ 是 musl 版(或者组件更新原样带过来的 glibc 版,那样这一步什么都不做),
-# 趁 .old 还在、还能整体回退的时候换成 glibc 版
-if [ "$PLATFORM" = "systemd" ]; then
-  info "Debian / Ubuntu:检查 glibc 版 Node 运行时..."
-  if ! _gn_err=$(openbox_glibc_node "$INSTALL_ROOT"); then
-    [ -n "$_gn_err" ] && printf '%s\n' "$_gn_err" >&2
-    swap_failed "glibc 版 Node 没装上(请检查能否访问 nodejs.org 或 npmmirror.com)。"
-  fi
-fi
 
 info "重新铺装 init 脚本与 LuCI 文件..."
 # 先把现有 init 脚本 / systemd 单元存一份到暂存目录:铺到一半失败要连组件一起整体回退
 mkdir -p "$STAGE_DIR/initd-backup" || swap_failed "无法创建 init 脚本备份目录。"
 for _initd in openbox openbox-panel; do
   if [ -e "$INITD_DIR/$_initd$INITD_SUFFIX" ]; then
-    cp "$INITD_DIR/$_initd$INITD_SUFFIX" "$STAGE_DIR/initd-backup/$_initd" || swap_failed "无法备份现有的 $INITD_DIR/$_initd$INITD_SUFFIX。"
+    cp "$INITD_DIR/$_initd$INITD_SUFFIX" "$STAGE_DIR/initd-backup/$_initd" || swap_failed "无法备份现有的 $INITD_DIR/$_initd${INITD_SUFFIX}。"
   fi
 done
 if [ "$PLATFORM" = "systemd" ]; then
@@ -1633,10 +1780,7 @@ else
   cp "$INSTALL_ROOT/openwrt/initd/openbox-panel" "$INITD_DIR/openbox-panel" || swap_failed "无法安装 $INITD_DIR/openbox-panel。"
   chmod +x "$INITD_DIR/openbox" "$INITD_DIR/openbox-panel"
 fi
-# 组件和 init 脚本都换好了,这才是删旧版本的时候
-for comp in $COMPONENTS; do
-  [ -e "$INSTALL_ROOT/$comp.old" ] && safe_rm_rf "$INSTALL_ROOT/$comp.old"
-done
+# 旧版本(.old)先留着:新版本的面板真的起来了才删(见下方),起不来还能整体回退
 # ---- swap:end ----
 
 if [ "$PLATFORM" = "openwrt" ]; then
@@ -1687,53 +1831,59 @@ if [ "$_acl_changed" = "1" ] && [ -x /etc/init.d/rpcd ]; then
 fi
 fi
 
-info "检查随包 Node 能否运行..."
-if ! _ob_node_err=$(openbox_node_smoke); then
-  warn "随包的 Node 在这台设备上起不来:"
-  [ -n "$_ob_node_err" ] && printf '%s\n' "$_ob_node_err" >&2
-  case "$_ob_node_err" in *"symbol not found"*) die "固件太老,请升级到 OpenWrt 24 以上。" ;; esac
-  die "面板跑不起来,升级中止。请把上面几行连同 uname -a、cat /etc/openwrt_release、head -3 /proc/meminfo 的输出发到 GitHub issue。"
-fi
+# 面板起来没有:轮询 /api/health(不用登录),最多等 $1 秒。端口按 data/panel-port,没有就是 2026。
+# 只看启动命令的返回值不够——procd / systemd 都是立刻返回,Node 随后崩溃循环也照样返回成功
+panel_healthy() {
+  _ph_port=$(cat "$INSTALL_ROOT/data/panel-port" 2>/dev/null | tr -dc '0-9' || true)
+  [ -n "$_ph_port" ] || _ph_port=2026
+  _ph_deadline=$(( $(date +%s) + $1 ))
+  while :; do
+    case "$DOWNLOADER" in
+      curl) _ph_body=$(curl -fsS --max-time 3 "http://127.0.0.1:$_ph_port/api/health" 2>/dev/null || true) ;;
+      *) _ph_body=$(wget -q -T 3 -O - "http://127.0.0.1:$_ph_port/api/health" 2>/dev/null || true) ;;
+    esac
+    case "$_ph_body" in *'"ok":true'*) return 0 ;; esac
+    [ "$(date +%s)" -lt "$_ph_deadline" ] || return 1
+    sleep 2
+  done
+}
 
 info "启动面板..."
 if [ "$PLATFORM" = "openwrt" ]; then
   RETRY_HINT="可稍后在 LuCI → 服务 → Open-Box 中重试"
+  PANEL_LOG_HINT="logread | grep node"
 else
   RETRY_HINT="可稍后用 systemctl status openbox-panel 查看原因"
+  PANEL_LOG_HINT="journalctl -u openbox-panel -n 50"
 fi
-"$PANEL_SVC" enable || warn "设置面板开机自启失败,$RETRY_HINT。"
-"$PANEL_SVC" start || warn "面板启动命令返回了非零状态,请稍后访问面板地址确认;如不可用$RETRY_HINT。"
+"$PANEL_SVC" enable || warn "设置面板开机自启失败,${RETRY_HINT}。"
+"$PANEL_SVC" start || warn "面板启动命令返回了非零状态,请稍后访问面板地址确认;如不可用${RETRY_HINT}。"
 PANEL_STARTED=1
 
-# 升级前内核在跑 → 现在按新版本重新生成配置并启动,走面板同款流水线(panel/server/cli/
-# deploy.mjs:冲突检测 → 规则集 → 校验 → 落盘 → DNS 接管 → 防火墙 → 启动 → 验证)。
-# 绝不能退回 init 脚本直接起旧配置:停内核时 DNS 接管已被还原,不经流水线重新接管就把内核
-# 拉起来,dnsmasq 模式下路由器自己的 DNS 会在 dnsmasq 和内核之间打环、什么都解析不了
-# (开发路由器实测)。目标版本没有这个脚本(只会是降级到老版本)就保持停止,提示去面板点启动。
-CORE_MSG="内核未自动重启——如之前配置并运行着代理服务,请到面板重新启动它。"
-if [ "$CORE_WAS_RUNNING" = "1" ]; then
-  DEPLOY_CLI="$INSTALL_ROOT/panel/server/cli/deploy.mjs"
-  if [ -x "$INSTALL_ROOT/node/bin/node" ] && [ -f "$DEPLOY_CLI" ]; then
-    # 面板这时已经起来了,前端能重新读到状态文件:给内核重启单独一个阶段,否则弹窗
-    # 一直停在"正在替换文件,面板即将重启…",用户不知道后面还有一次内核重启(约 20 秒)。
-    write_status restarting_core "" "" "面板已重启,正在按新版本重新生成配置并启动内核"
-    info "升级前内核在运行,按新版本重新生成配置并启动内核..."
-    if OPENBOX_ROOT="$INSTALL_ROOT" ZASHBOARD_DB_PATH="$INSTALL_ROOT/data/openbox.sqlite" \
-       OPENSSL_CONF=/dev/null LD_LIBRARY_PATH="$INSTALL_ROOT/node/lib" "$INSTALL_ROOT/node/bin/node" "$DEPLOY_CLI" >/dev/null 2>&1; then
-      CORE_MSG="内核已按新版本重新生成配置并启动。"
-    else
-      warn "内核启动失败(配置生成或校验没通过),请到面板查看原因后重新启动。"
-      CORE_MSG="内核启动失败,请到面板查看原因后重新启动。"
-    fi
-  else
-    warn "这个版本没有自动启动内核的脚本,请到面板重新启动内核。"
-    CORE_MSG="这个版本没有自动启动内核的脚本,请到面板重新启动内核。"
+# ---------- 面板起来了才删旧版本;起不来就整体回退 ----------
+# 慢的路由器上 Node 起来要十几二十秒,第一次启动还要迁移数据:给足 90 秒
+info "等待新版本的面板应答..."
+if ! panel_healthy "${OPENBOX_UPDATE_HEALTH_WAIT:-90}"; then
+  warn "新版本 $NEW_VERSION 的面板启动后一直没有应答,整体回退到 ${OLD_VERSION:-升级前的版本}..."
+  write_status committing "" "" "新版本的面板没有起来,正在回退到 ${OLD_VERSION:-升级前的版本}"
+  "$PANEL_SVC" stop >/dev/null 2>&1 || true
+  if rollback_components; then
+    "$PANEL_SVC" start >/dev/null 2>&1 || true
+    restart_core
+    die "新版本 $NEW_VERSION 的面板启动后没有应答,已整体回退到 ${OLD_VERSION:-升级前的版本}。${CORE_MSG}请把 $PANEL_LOG_HINT 的输出发到 GitHub issue。"
   fi
+  "$PANEL_SVC" start >/dev/null 2>&1 || true
+  die "新版本 $NEW_VERSION 的面板起不来,回退时也失败了(没能挪回:$_rb_failed),安装现处于不一致状态:请检查 $INSTALL_ROOT 下各组件与对应的 .old 目录,必要时手工把 .old 挪回原名,或重新运行安装脚本。"
 fi
+for comp in $COMPONENTS; do
+  [ -e "$INSTALL_ROOT/$comp.old" ] && safe_rm_rf "$INSTALL_ROOT/$comp.old"
+done
+
+restart_core
 
 write_status done "" "" "升级完成:$NEW_VERSION;$CORE_MSG"
 
 echo ""
-echo "Open-Box 已升级到 $NEW_VERSION。"
+echo "Open-Box 已升级到 ${NEW_VERSION}。"
 echo "面板已重新启动;$CORE_MSG"
 echo ""

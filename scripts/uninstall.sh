@@ -182,7 +182,7 @@ safe_rm_rf() {
 if [ "${OPENBOX_UNINSTALL_RELOCATED:-0}" != "1" ]; then
   case "$0" in
     "$INSTALL_ROOT"/*)
-      UNINSTALL_TMP_PARENT=$(openbox_pick_tmp_parent) || die "找不到可写的临时目录(依次试过 ${OPENBOX_TMPDIR:+$OPENBOX_TMPDIR、}$(dirname -- "$INSTALL_ROOT")、/var/tmp、/root、/tmp)。最后一次的错误:${openbox_tmp_probe_err:-未知}。"
+      UNINSTALL_TMP_PARENT=$(openbox_pick_tmp_parent) || die "找不到可写的临时目录(依次试过 ${OPENBOX_TMPDIR:+${OPENBOX_TMPDIR}、}$(dirname -- "$INSTALL_ROOT")、/var/tmp、/root、/tmp)。最后一次的错误:${openbox_tmp_probe_err:-未知}。"
       _self_copy="$UNINSTALL_TMP_PARENT/.openbox-uninstall.$$.sh"
       cp -f -- "$0" "$_self_copy" || die "无法复制卸载脚本到临时目录:$UNINSTALL_TMP_PARENT,请改用:wget -O- <脚本地址> | sh"
       chmod +x "$_self_copy" 2>/dev/null || true
@@ -286,7 +286,7 @@ if [ "$DETACH" = "1" ]; then
       ) >/dev/null 2>&1 &
     ) >/dev/null 2>&1 &
   fi
-  info "卸载已在后台开始,进度见 $STATUS_PATH。"
+  info "卸载已在后台开始,进度见 ${STATUS_PATH}。"
   exit 0
 fi
 
