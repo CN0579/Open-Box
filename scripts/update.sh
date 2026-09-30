@@ -507,7 +507,31 @@ probe_content_length() {
 # 返回:下载成功且未被取消 → 0;下载命令本身失败(网络错误等)→ 透传其退出码,
 # 调用方按老逻辑 die();被取消 → 直接 write_status cancelled 并 exit 0,不返回
 # (与 check_cancel_and_abort() 一致的收尾方式,复用同一个 cleanup() trap)。
+# 下载失败时换来源再试(openbox_download_sources)。组件升级走的是装着的老 update-components.sh,传进来的地址已经拼好
+# 镜像前缀,所以先还原成原始地址再排来源;第一个就是刚才失败的那个,跳过。成功的来源留给后面的下载
 download_with_progress() {
+  download_with_progress_once "$1" "$2" "$3" && return 0
+  _dwf_orig=$(openbox_unmirror_url "$1")
+  if [ "$CHANNEL" = "mirror" ] && [ -n "$MIRROR_PREFIX" ]; then _dwf_prev=$(openbox_source_label "$MIRROR_PREFIX"); else _dwf_prev=$(openbox_source_label direct); fi
+  _dwf_ifs=$IFS
+  IFS='
+'
+  for _dwf_line in $(openbox_download_sources "$_dwf_orig"); do
+    IFS=$_dwf_ifs
+    _dwf_src=${_dwf_line%% *}
+    _dwf_full=${_dwf_line#* }
+    [ "$_dwf_full" = "$1" ] && continue
+    warn "从 ${_dwf_prev} 下载失败,换 $(openbox_source_label "$_dwf_src") 再试..."
+    if download_with_progress_once "$_dwf_full" "$2" "$3"; then
+      openbox_adopt_source "$_dwf_src"
+      return 0
+    fi
+    _dwf_prev=$(openbox_source_label "$_dwf_src")
+  done
+  IFS=$_dwf_ifs
+  return 1
+}
+download_with_progress_once() {
   _dwp_url="$1"
   _dwp_out="$2"
   _dwp_total="$3"
@@ -1182,6 +1206,7 @@ info "预检通过(架构 $ARCH,通道 $CHANNEL)。"
 DEP_TUN_DEV="${DEP_TUN_DEV:-/dev/net/tun}"
 DEP_SYS_MODULE="${DEP_SYS_MODULE:-/sys/module}"
 DEP_CA_BUNDLE="${DEP_CA_BUNDLE:-/etc/ssl/certs/ca-certificates.crt}"
+DEP_OPENWRT_RELEASE="${DEP_OPENWRT_RELEASE:-/etc/openwrt_release}"
 dep_ok() {
   case "$1" in
     kmod-tun) [ -e "$DEP_TUN_DEV" ] || { modprobe tun >/dev/null 2>&1; [ -e "$DEP_TUN_DEV" ]; } ;;
@@ -1209,13 +1234,127 @@ dep_pkg() {
 dep_effect() {
   case "$1" in
     kmod-tun) echo "内核起不来(没有 tun 设备)" ;;
-    kmod-nft-queue) echo "内核只能以纯 tun 兼容模式运行,吞吐更低" ;;
+    # 2026-09-30 开发路由器实测(内核 1.14.1 / sing-tun 0.9.3):两个 queue 模块都没有时 nftables 转发照常,只关掉首包预判;
+    # 有 nfnetlink_queue、缺 nft_queue 时 nft 规则装不上,内核自动降级纯 tun
+    kmod-nft-queue)
+      if [ -d "$DEP_SYS_MODULE/nfnetlink_queue" ] || modprobe nfnetlink_queue >/dev/null 2>&1; then
+        echo "nftables 转发起不来,内核会自动改用纯 tun 兼容模式,吞吐低一些"
+      else
+        echo "只影响入口的「首包预判放行」(直连终端、节点地址的连接先进内核再直连出去),nftables 转发和其它功能照常"
+      fi
+      ;;
     kmod-nft-nat) echo "auto_redirect 转发规则加不上,退到兼容模式" ;;
     kmod-veth|ip-full) echo "规则页不能模拟 LAN 终端(可改用内核诊断)" ;;
     ca-bundle) echo "HTTPS 订阅和更新下载会因证书校验失败" ;;
     nftables) echo "起内核前装不上 Open-Box 自己的 nft 表(进内核前放行 / 直连应答放行不生效)" ;;
     xz-utils) echo "解不开 nodejs.org 的 Node 压缩包,面板跑不起来" ;;
   esac
+}
+# 各包管理器的软件源配置在哪(提示用)
+dep_feeds() {
+  case "${_dep_pm:-}" in
+    opkg) echo "/etc/opkg/distfeeds.conf" ;;
+    apk) echo "/etc/apk/repositories.d/distfeeds.list" ;;
+    apt-get) echo "/etc/apt/sources.list(.d)" ;;
+    *) echo "软件源配置" ;;
+  esac
+}
+# ---- 按本机内核版本自动找 queue 模块 ----
+# 固件自带的软件源里常常装不上 kmod-nft-queue:第三方固件的源里没有官方内核模块,或者源已经失效(sbwml 固件的
+# core.cooluc.com),用户自己去找又极麻烦(2026-09-30 香港两台)。内核模块必须和内核同一次编译完全一致,opkg 里
+# kernel 包的版本号就是这个身份(24.10 起 6.6.104~<哈希>-r1,23.05 是 5.15.167-1-<哈希>)。按它去已知的内核模块源找:
+#   · sbwml 固件:github.com/sbwml/openwrt_core 的 <架构> 分支、<版本号> 目录
+#   · 官方 OpenWrt / ImmortalWrt 发布版:releases/<版本>/targets/<平台>/kmods/<版本>-<n>-<哈希>/
+# 直连不通换国内镜像(GitHub → ghfast.top,官方 → 中科大)。只装依赖里写着同一个内核版本、SHA256 对得上的包;
+# 下到本地用 opkg install 装,不改用户的软件源配置
+dep_get() {
+  if command -v curl >/dev/null 2>&1; then curl -fsSL --connect-timeout 10 --max-time 60 -o "$2" "$1" 2>/dev/null
+  else wget -q -T 30 -O "$2" "$1" 2>/dev/null; fi
+}
+dep_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi
+}
+dep_kernel_version() { opkg list-installed kernel 2>/dev/null | awk '$1 == "kernel" { print $3; exit }'; }
+dep_release_field() { sed -n "s/^$1='\(.*\)'\$/\1/p" "$DEP_OPENWRT_RELEASE" 2>/dev/null | head -n 1; }
+# 本机内核可能对得上的内核模块源,每行一个目录地址
+dep_kmod_bases() {
+  case "$1" in
+    *~*-r*) _kb_dir="${1%%~*}-${1##*-r}-$(echo "$1" | sed 's/^[^~]*~//; s/-r[0-9]*$//')" ;;
+    *) _kb_dir="$1" ;;
+  esac
+  _kb_arch=$(dep_release_field DISTRIB_ARCH)
+  _kb_rel=$(dep_release_field DISTRIB_RELEASE)
+  _kb_tgt=$(dep_release_field DISTRIB_TARGET)
+  case "$1" in
+    *~*)
+      case "$_kb_arch" in
+        x86_64|arm_cortex-a9) echo "https://raw.githubusercontent.com/sbwml/openwrt_core/$_kb_arch/$1" ;;
+        aarch64_*)
+          echo "https://raw.githubusercontent.com/sbwml/openwrt_core/aarch64_generic/$1"
+          echo "https://raw.githubusercontent.com/sbwml/openwrt_core/armsr-armv8/$1" ;;
+      esac ;;
+  esac
+  if [ -n "$_kb_rel" ] && [ -n "$_kb_tgt" ]; then
+    echo "https://downloads.openwrt.org/releases/$_kb_rel/targets/$_kb_tgt/kmods/$_kb_dir"
+    echo "https://downloads.immortalwrt.org/releases/$_kb_rel/targets/$_kb_tgt/kmods/$_kb_dir"
+  fi
+}
+# 同一个目录的国内镜像(直连不通时用)
+dep_kmod_mirror() {
+  case "$1" in
+    https://raw.githubusercontent.com/*) echo "https://ghfast.top/$1" ;;
+    https://downloads.openwrt.org/*) echo "https://mirrors.ustc.edu.cn/openwrt/${1#https://downloads.openwrt.org/}" ;;
+    https://downloads.immortalwrt.org/*) echo "https://mirrors.ustc.edu.cn/immortalwrt/${1#https://downloads.immortalwrt.org/}" ;;
+  esac
+}
+# 索引(Packages)里某个包的某个字段
+dep_pkg_field() {
+  awk -v p="$2" -v f="$3: " '$0 == "Package: " p { hit = 1; next } /^Package: / { hit = 0 } hit && index($0, f) == 1 { print substr($0, length(f) + 1); exit }' "$1"
+}
+# 从源目录 $1(索引已解到 $2)下载包 $3 到 $5:依赖里的内核版本必须是本机的 $4,SHA256 必须和索引一致。成功时打印本地路径
+dep_kmod_fetch_pkg() {
+  _kp_dep=$(dep_pkg_field "$2" "$3" Depends)
+  case "$_kp_dep" in *"kernel (=$4)"*) ;; *) return 1 ;; esac
+  _kp_file=$(dep_pkg_field "$2" "$3" Filename)
+  _kp_sha=$(dep_pkg_field "$2" "$3" SHA256sum)
+  [ -n "$_kp_file" ] && [ -n "$_kp_sha" ] || return 1
+  case "$_kp_file" in */*|*..*) return 1 ;; esac
+  dep_get "$1/$_kp_file" "$5/$_kp_file" || return 1
+  [ "$(dep_sha256 "$5/$_kp_file")" = "$_kp_sha" ] || { rm -f "$5/$_kp_file"; return 1; }
+  echo "$5/$_kp_file"
+}
+# 装上 kmod-nft-queue(连同还没装的 kmod-nfnetlink-queue)就返回 0
+dep_kmod_autofetch() {
+  _ka_ver=$(dep_kernel_version)
+  [ -n "$_ka_ver" ] || return 1
+  _dep_kmod_searched=1
+  info "按本机内核版本 $_ka_ver 自动查找对得上的 kmod-nft-queue..."
+  _ka_tmp="${TMPDIR:-/tmp}/openbox-kmod.$$"
+  rm -rf "$_ka_tmp"
+  mkdir -p "$_ka_tmp" || return 1
+  _ka_rc=1
+  for _ka_base in $(dep_kmod_bases "$_ka_ver"); do
+    for _ka_try in "$_ka_base" "$(dep_kmod_mirror "$_ka_base")"; do
+      [ -n "$_ka_try" ] || continue
+      rm -f "$_ka_tmp"/*
+      dep_get "$_ka_try/Packages.gz" "$_ka_tmp/Packages.gz" || continue
+      gunzip -c "$_ka_tmp/Packages.gz" > "$_ka_tmp/Packages" 2>/dev/null || continue
+      _ka_q=$(dep_kmod_fetch_pkg "$_ka_try" "$_ka_tmp/Packages" kmod-nft-queue "$_ka_ver" "$_ka_tmp") || continue
+      _ka_n=""
+      if ! opkg list-installed kmod-nfnetlink-queue 2>/dev/null | grep -q .; then
+        _ka_n=$(dep_kmod_fetch_pkg "$_ka_try" "$_ka_tmp/Packages" kmod-nfnetlink-queue "$_ka_ver" "$_ka_tmp") || continue
+      fi
+      # 找到了对得上的包:装一次,成不成都不再往下找(别的源不会有同一次编译的另一份)
+      if opkg install $_ka_n "$_ka_q" >/dev/null 2>&1 && dep_ok kmod-nft-queue; then
+        info "kmod-nft-queue 已装上(来自 $(echo "$_ka_try" | awk -F/ '{print $3}'))。"
+        _ka_rc=0
+      fi
+      rm -rf "$_ka_tmp"
+      return "$_ka_rc"
+    done
+  done
+  rm -rf "$_ka_tmp"
+  return 1
 }
 ensure_dependencies() {
   if [ "${OPENBOX_SKIP_DEPS:-}" = "1" ]; then
@@ -1232,6 +1371,10 @@ ensure_dependencies() {
   fi
   _dep_pm=""
   _dep_verb=""
+  _dep_updated=1
+  _dep_unknown=""
+  _dep_kernel=""
+  _dep_kmod_searched=0
   if command -v opkg >/dev/null 2>&1; then _dep_pm=opkg; _dep_verb="opkg install"
   elif command -v apk >/dev/null 2>&1; then _dep_pm=apk; _dep_verb="apk add"
   elif command -v apt-get >/dev/null 2>&1; then _dep_pm=apt-get; _dep_verb="apt-get install -y --no-install-recommends"; export DEBIAN_FRONTEND=noninteractive
@@ -1242,14 +1385,24 @@ ensure_dependencies() {
     info "缺少系统依赖:${_dep_missing# },尝试用 $_dep_pm 安装(软件源不通时只提示,不中断)..."
     _dep_to=""
     command -v timeout >/dev/null 2>&1 && _dep_to="timeout 180"
-    $_dep_to $_dep_pm update >/dev/null 2>&1 || warn "$_dep_pm update 失败(软件源不通?),仍尝试安装。"
-    # 逐个装:一个装不上不连累其它(内核模块包要和当前内核版本一致,厂商固件常对不上)
+    _dep_updated=1
+    $_dep_to $_dep_pm update >/dev/null 2>&1 || { _dep_updated=0; warn "$_dep_pm update 失败(软件源不通?),仍尝试安装。"; }
+    # 逐个装:一个装不上不连累其它(内核模块包要和当前内核版本一致,厂商固件常对不上)。记下装不上的原因,
+    # 最后按原因提示——以前一律提示「opkg install 包名」,软件源不通 / 源里没有这个包时照着敲也只会得到 Unknown package
     for _d in $_dep_missing; do
       _dep_pkg=$(dep_pkg "$_d")
       [ -n "$_dep_pkg" ] || continue
-      $_dep_to $_dep_verb "$_dep_pkg" >/dev/null 2>&1 || true
+      _dep_out=$($_dep_to $_dep_verb "$_dep_pkg" 2>&1) || true
+      # 内核对不上时 opkg 也先打一行 Unknown package(真机输出),所以先认内核
+      case "$_dep_out" in
+        *"kernel (="*|*"kernel="*) _dep_kernel="$_dep_kernel $_d" ;;
+        *"Unknown package"*|*"no such package"*) _dep_unknown="$_dep_unknown $_d" ;;
+      esac
     done
   fi
+  case " $_dep_missing " in
+    *" kmod-nft-queue "*) [ "$_dep_pm" = "opkg" ] && ! dep_ok kmod-nft-queue && dep_kmod_autofetch ;;
+  esac
   _dep_still=""
   for _d in $_dep_missing; do dep_ok "$_d" || _dep_still="$_dep_still $_d"; done
   if [ -z "$_dep_still" ]; then
@@ -1258,15 +1411,75 @@ ensure_dependencies() {
   fi
   for _d in $_dep_still; do
     _dep_pkg=$(dep_pkg "$_d")
-    if [ -n "$_dep_pkg" ]; then
-      warn "仍缺 $_d:$(dep_effect "$_d")。可稍后手动执行:${_dep_verb:-opkg install} $_dep_pkg"
-    else
+    if [ -z "$_dep_pkg" ]; then
       warn "仍缺 $_d:$(dep_effect "$_d")。这个内核模块应随系统内核自带,请检查内核配置(modprobe ${_d#kmod-} 的报错)。"
+    elif [ "$_d" = "kmod-nft-queue" ] && [ "$_dep_kmod_searched" = "1" ]; then
+      warn "仍缺 $_d:$(dep_effect "$_d")。固件的软件源里装不上,官方 OpenWrt / ImmortalWrt 和 sbwml 固件的内核模块源里也没有和本机内核对得上的包;要装只能从固件作者的软件源装。"
+    elif [ "$_dep_updated" = "0" ]; then
+      warn "仍缺 $_d:$(dep_effect "$_d")。$_dep_pm update 没成功,软件源连不上时什么包都装不了:先检查 $(dep_feeds) 里的软件源地址(国内连不上官方源可换镜像),等 $_dep_pm update 能成功后再执行:$_dep_pm update && $_dep_verb $_dep_pkg"
+    else
+      case " $_dep_unknown " in
+        *" $_d "*) warn "仍缺 $_d:$(dep_effect "$_d")。软件源里没有这个包(第三方固件的软件源里常没有官方内核模块):换一个自带 $_dep_pkg 的固件,或者从固件作者的软件源安装。" ;;
+        *)
+          case " $_dep_kernel " in
+            *" $_d "*) warn "仍缺 $_d:$(dep_effect "$_d")。软件源里的 $_dep_pkg 和本机内核版本对不上(第三方 / 厂商固件常见):从固件作者的软件源安装,或者换一个自带它的固件。" ;;
+            *) warn "仍缺 $_d:$(dep_effect "$_d")。可稍后手动执行:$_dep_pm update && ${_dep_verb:-opkg install} $_dep_pkg" ;;
+          esac
+          ;;
+      esac
     fi
   done
   return 0
 }
 ensure_dependencies
+
+# ---- openbox-download-sources:start ----
+# 这一段在 install.sh / update.sh 里一模一样。下载正文失败时按顺序换来源再试:当前通道 → 其余内置镜像 → 直连
+# (当前是镜像时)。以前一次失败就退出——同一个镜像每次都在同一处断开的用户永远装不上(GitHub #330:Debian 13 +
+# ghfast.top,每次 SSL unexpected eof)。每行一个「来源 完整地址」,来源是 direct 或镜像前缀;BUILTIN_MIRRORS 在调用时已定义
+openbox_download_sources() {
+  # 调用方常把 IFS 设成只有换行(逐行读结果),这里要按空白拆
+  _ds_ifs=$IFS
+  IFS='
+	 '
+  if [ "$CHANNEL" = "mirror" ] && [ -n "$MIRROR_PREFIX" ]; then _ds_cur="$MIRROR_PREFIX"; else _ds_cur="direct"; fi
+  _ds_list="$_ds_cur"
+  for _ds_m in $BUILTIN_MIRRORS; do
+    [ "$_ds_m" = "$_ds_cur" ] || _ds_list="$_ds_list $_ds_m"
+  done
+  [ "$_ds_cur" = "direct" ] || _ds_list="$_ds_list direct"
+  for _ds_src in $_ds_list; do
+    case "$_ds_src" in
+      direct) printf 'direct %s\n' "$1" ;;
+      http://*|https://*) printf '%s %s/%s\n' "$_ds_src" "${_ds_src%/}" "$1" ;;
+      *) printf '%s https://%s/%s\n' "$_ds_src" "${_ds_src%/}" "$1" ;;
+    esac
+  done
+  IFS=$_ds_ifs
+}
+# 拼好镜像前缀的地址还原成原始地址(升级时组件脚本传进来的就是拼好的)
+openbox_unmirror_url() {
+  _uu="$1"
+  if [ "$CHANNEL" = "mirror" ] && [ -n "$MIRROR_PREFIX" ]; then
+    case "$MIRROR_PREFIX" in
+      http://*|https://*) _uu_p="${MIRROR_PREFIX%/}/" ;;
+      *) _uu_p="https://${MIRROR_PREFIX%/}/" ;;
+    esac
+    case "$_uu" in "$_uu_p"*) _uu="${_uu#"$_uu_p"}" ;; esac
+  fi
+  printf '%s\n' "$_uu"
+}
+# 哪个来源下载成功就改用它,后面的下载先从它开始
+openbox_adopt_source() {
+  case "$1" in
+    direct) CHANNEL=direct; MIRROR_PREFIX="" ;;
+    *) CHANNEL=mirror; MIRROR_PREFIX="$1" ;;
+  esac
+}
+openbox_source_label() {
+  case "$1" in direct) echo "GitHub 直连" ;; *) echo "$1" ;; esac
+}
+# ---- openbox-download-sources:end ----
 
 detect_downloader
 
@@ -1499,7 +1712,7 @@ while :; do
   ASSET_DL_URL=$(build_url "$ASSET_URL")
   ASSET_TOTAL=$(probe_content_length "$ASSET_DL_URL")
   case "$ASSET_TOTAL" in ''|*[!0-9]*) ASSET_TOTAL='' ;; esac
-  download_with_progress "$ASSET_DL_URL" "$TMP_DL/$ASSET" "$ASSET_TOTAL" || die "下载升级包失败:${ASSET_URL}。现有安装未改动。"
+  download_with_progress "$ASSET_DL_URL" "$TMP_DL/$ASSET" "$ASSET_TOTAL" || die "下载升级包失败(内置镜像和直连都试过了):${ASSET_URL}。现有安装未改动。"
 
   check_cancel_and_abort
 
